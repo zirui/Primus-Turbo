@@ -32,7 +32,7 @@ from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
 )
 from primus_turbo.pytorch.ops.quantization import quantize_fp8_with_trans
 
-__all__ = ["gemm_fp8"]
+__all__ = ["gemm_fp8", "gemm_mxfp8"]
 
 
 def _get_fp8_dtype(format: Format, is_fwd_stage: bool):
@@ -652,6 +652,125 @@ class FP8GemmMXFunction(torch.autograd.Function):
             None,  # out_dtype
             None,  # config
         )
+
+
+def _mxfp8_forward(a: torch.Tensor, b: torch.Tensor, format_name: str):
+    fp8_dtype = _get_fp8_dtype(Format[format_name], True)
+    a_row, a_row_scale, a_col, a_col_scale = quantize_fp8_with_trans(
+        a,
+        fp8_dtype,
+        ScalingGranularity.MX_BLOCKWISE,
+        block_size=32,
+        scaling_recipe=ScalingRecipe(),
+    )
+    weight_recipe = ScalingRecipe(use_2d_block=True)
+    b_row, b_row_scale, b_col, b_col_scale = quantize_fp8_with_trans(
+        b,
+        fp8_dtype,
+        ScalingGranularity.MX_BLOCKWISE,
+        block_size=32,
+        scaling_recipe=weight_recipe,
+        scaling_recipe_for_trans=weight_recipe,
+    )
+    out = gemm_fp8_impl(
+        a_row,
+        a_row_scale,
+        False,
+        b_row,
+        b_row_scale,
+        True,
+        a.dtype,
+        False,
+        granularity=ScalingGranularity.MX_BLOCKWISE.value,
+        default_backend=BackendType.FLYDSL.value,
+    )
+    return out, a_col, a_col_scale, b_col, b_col_scale
+
+
+@torch.library.custom_op("primus_turbo::gemm_mxfp8", mutates_args=())
+def _gemm_mxfp8(
+    a: torch.Tensor, b: torch.Tensor, format_name: str, wgrad_with_hp: bool
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return _mxfp8_forward(a, b, format_name)
+
+
+@_gemm_mxfp8.register_fake
+def _gemm_mxfp8_fake(a, b, format_name, wgrad_with_hp):
+    m, k = a.shape
+    n = b.shape[0]
+    m_padded = (m + 127) // 128 * 128
+    n_padded = (n + 127) // 128 * 128
+    fp8_dtype = _get_fp8_dtype(Format[format_name], True)
+    scale_dtype = torch.float8_e8m0fnu
+    return (
+        a.new_empty((m, n)),
+        a.new_empty((k, m_padded), dtype=fp8_dtype),
+        a.new_empty((k, m_padded // 32), dtype=scale_dtype),
+        b.new_empty((k, n_padded), dtype=fp8_dtype),
+        b.new_empty((k, n_padded // 32), dtype=scale_dtype),
+    )
+
+
+def _setup_mxfp8_context(ctx, inputs, output):
+    a, _, format_name, wgrad_with_hp = inputs
+    _, a_col, a_col_scale, b_col, b_col_scale = output
+    if wgrad_with_hp:
+        ctx.save_for_backward(a, b_col, b_col_scale)
+    else:
+        ctx.save_for_backward(a_col, a_col_scale, b_col, b_col_scale)
+    ctx.format_name = format_name
+    ctx.wgrad_with_hp = wgrad_with_hp
+
+
+def _backward_mxfp8(ctx, grad_out, _a_col_grad, _a_scale_grad, _b_col_grad, _b_scale_grad):
+    if ctx.wgrad_with_hp:
+        a, b_col, b_col_scale = ctx.saved_tensors
+    else:
+        a_col, a_col_scale, b_col, b_col_scale = ctx.saved_tensors
+    grad_out = grad_out.reshape(grad_out.shape[0], -1).contiguous()
+    grad_dtype = _get_fp8_dtype(Format[ctx.format_name], False)
+    g_row, g_row_scale, g_col, g_col_scale = quantize_fp8_with_trans(
+        grad_out,
+        grad_dtype,
+        ScalingGranularity.MX_BLOCKWISE,
+        block_size=32,
+    )
+    grad_a = gemm_fp8_impl(
+        g_row,
+        g_row_scale,
+        False,
+        b_col,
+        b_col_scale,
+        True,
+        grad_out.dtype,
+        False,
+        granularity=ScalingGranularity.MX_BLOCKWISE.value,
+        default_backend=BackendType.FLYDSL.value,
+    )
+    if ctx.wgrad_with_hp:
+        grad_b = grad_out.t() @ a
+    else:
+        grad_b = gemm_fp8_impl(
+            g_col,
+            g_col_scale,
+            False,
+            a_col,
+            a_col_scale,
+            True,
+            grad_out.dtype,
+            False,
+            granularity=ScalingGranularity.MX_BLOCKWISE.value,
+            default_backend=BackendType.FLYDSL.value,
+        )
+    return grad_a, grad_b, None, None
+
+
+_gemm_mxfp8.register_autograd(_backward_mxfp8, setup_context=_setup_mxfp8_context)
+
+
+def gemm_mxfp8(a: torch.Tensor, b: torch.Tensor, format: Format, wgrad_with_hp: bool = False) -> torch.Tensor:
+    """Compile-friendly MXFP8 NT GEMM with autograd."""
+    return _gemm_mxfp8(a, b, format.name, wgrad_with_hp)[0]
 
 
 @torch._dynamo.disable(

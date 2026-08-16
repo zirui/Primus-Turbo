@@ -11,6 +11,7 @@ import torch.nn as nn
 from primus_turbo.pytorch.core.low_precision import (
     Float8QuantConfig,
     Format,
+    ScaleDtype,
     ScalingGranularity,
 )
 from primus_turbo.pytorch.modules import Float8Linear
@@ -100,3 +101,30 @@ def test_float8linear(config, dtype, format, M, N, K, bias, enable_torch_compile
 
     if bias:
         torch.testing.assert_close(bias_grad, bias_grad_ref, **get_tolerances(dtype))
+
+
+@pytest.mark.parametrize("format", [Format.E4M3, Format.HYBRID])
+@pytest.mark.parametrize("wgrad_with_hp", [False, True])
+def test_mxfp8_linear_fullgraph(format, wgrad_with_hp):
+    config = Float8QuantConfig(
+        format=format,
+        granularity=ScalingGranularity.MX_BLOCKWISE,
+        block_size=32,
+        scale_dtype=ScaleDtype.E8M0,
+    )
+    reference = nn.Linear(512, 256, bias=True, device="cuda", dtype=torch.bfloat16)
+    model = Float8Linear.from_float(reference, config, inplace=False, wgrad_with_hp=wgrad_with_hp)
+    model = torch.compile(model, fullgraph=True)
+
+    x_ref = torch.randn(256, 512, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    x = x_ref.detach().clone().requires_grad_()
+    grad_out = torch.randn(256, 512, device="cuda", dtype=torch.bfloat16)[:, ::2]
+    out_ref = reference(x_ref)
+    out_ref.backward(grad_out)
+    out = model(x)
+    out.backward(grad_out)
+
+    assert compute_snr(out_ref, out) > 20
+    assert compute_snr(x_ref.grad, x.grad) > 20
+    assert compute_snr(reference.weight.grad, model.weight.grad) > 20
+    torch.testing.assert_close(reference.bias.grad, model.bias.grad, **get_tolerances(torch.bfloat16))

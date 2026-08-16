@@ -12,7 +12,7 @@ from primus_turbo.pytorch.core.low_precision import (
     Float8QuantConfig,
     ScalingGranularity,
 )
-from primus_turbo.pytorch.ops.gemm_fp8 import gemm_fp8
+from primus_turbo.pytorch.ops.gemm_fp8 import gemm_fp8, gemm_mxfp8
 
 __all__ = ["Float8Linear"]
 
@@ -51,9 +51,11 @@ class Float8Linear(torch.nn.Linear):
         out_features: int,
         bias: bool = True,
         config: Optional[Float8QuantConfig] = None,
+        wgrad_with_hp: bool = False,
         **kwargs,
     ):
         super().__init__(in_features, out_features, bias, **kwargs)
+        self.wgrad_with_hp = wgrad_with_hp
         if config is None:
             config = Float8QuantConfig(granularity=ScalingGranularity.TENSORWISE)
         self.config = config
@@ -62,9 +64,12 @@ class Float8Linear(torch.nn.Linear):
         flatten_shapes = x.shape[:-1]
         x_2d = x.reshape(-1, self.in_features)
 
-        out_2d = gemm_fp8(
-            x_2d, self.weight, trans_a=False, trans_b=True, out_dtype=x.dtype, config=self.config
-        )
+        if self.config.granularity == ScalingGranularity.MX_BLOCKWISE:
+            out_2d = gemm_mxfp8(x_2d, self.weight, self.config.format, self.wgrad_with_hp)
+        else:
+            out_2d = gemm_fp8(
+                x_2d, self.weight, trans_a=False, trans_b=True, out_dtype=x.dtype, config=self.config
+            )
 
         if self.bias is not None:
             out_2d = out_2d + self.bias
@@ -78,6 +83,7 @@ class Float8Linear(torch.nn.Linear):
         mod: torch.nn.Linear,
         config: Optional[Float8QuantConfig] = None,
         inplace: bool = True,
+        wgrad_with_hp: bool = False,
     ):
         """
         Convert a torch.nn.Linear module to Float8Linear.
@@ -99,6 +105,7 @@ class Float8Linear(torch.nn.Linear):
             # In-place conversion
             mod.__class__ = Float8Linear
             mod.config = config
+            mod.wgrad_with_hp = wgrad_with_hp
             return mod
         else:
             # Create new module
@@ -107,6 +114,7 @@ class Float8Linear(torch.nn.Linear):
                 mod.out_features,
                 bias=mod.bias is not None,
                 config=config,
+                wgrad_with_hp=wgrad_with_hp,
                 device=mod.weight.device,
                 dtype=mod.weight.dtype,
             )
