@@ -27,6 +27,8 @@ Scale tensor layout expected by this kernel (passed pre-packed from host):
 i.e. the raw uint8 E8M0 [DIM, K//32] viewed little-endian as int32.
 """
 
+import os
+
 import torch
 
 # isort: off
@@ -382,6 +384,26 @@ _MXFP8_NT_CANDIDATES = [
 
 _MXFP8_AUTOTUNE_CACHE: dict = {}  # (M,N,K,out_dtype,cbsz,blgp) -> (BLOCK_M, GROUP_M, num_xcd, group_n)
 
+# Offline-tuned E4M3 FLUX training shapes. Opt in to avoid every distributed rank
+# repeating the expensive first-use autotune.
+_FLUX_E4M3_CONFIGS = {
+    (12288, 3072, 16384): (256, 4, 8, 0),
+    (16384, 12288, 3072): (256, 4, 8, 16),
+    (16384, 3072, 12288): (256, 8, 8, 0),
+    (16384, 3072, 3072): (256, 8, 8, 0),
+    (16384, 3072, 9216): (256, 4, 8, 0),
+    (16384, 9216, 3072): (256, 4, 8, 0),
+    (21504, 3072, 32768): (256, 4, 8, 0),
+    (3072, 12288, 16384): (256, 8, 8, 0),
+    (3072, 15360, 32768): (256, 8, 8, 0),
+    (3072, 3072, 16384): (256, 8, 8, 0),
+    (32768, 15360, 3072): (256, 4, 8, 4),
+    (32768, 21504, 3072): (256, 8, 8, 4),
+    (32768, 3072, 15360): (256, 4, 8, 0),
+    (32768, 3072, 21504): (256, 4, 8, 0),
+    (9216, 3072, 16384): (256, 4, 8, 0),
+}
+
 
 def _mx_nt_gn_cands(N):
     """NT 2D N-band candidate widths for the autotune stage-2 sweep. The seed band
@@ -391,8 +413,6 @@ def _mx_nt_gn_cands(N):
     Winners are shape-dependent (NT: 7B GateUp gn16, 70B QKV gn8/16), so the
     per-shape bench picks rather than a single heuristic. Set env MX_DISABLE_NT_GN
     to force the seed band (NT -> 1D swizzle)."""
-    import os
-
     if os.environ.get("MX_DISABLE_NT_GN"):
         return []
     n_blocks = (N + _BLOCK_N - 1) // _BLOCK_N
@@ -512,6 +532,11 @@ def _autotune_mxfp8(
     cached = _MXFP8_AUTOTUNE_CACHE.get(key)
     if cached is not None:
         return cached
+    if os.environ.get("PRIMUS_TURBO_MXFP8_USE_FLUX_CONFIGS") and cbsz == 0 and blgp == 0:
+        fixed = _FLUX_E4M3_CONFIGS.get((M, N, K))
+        if fixed is not None:
+            _MXFP8_AUTOTUNE_CACHE[key] = fixed
+            return fixed
     cands = _MXFP8_NT_CANDIDATES
     stream = torch.cuda.current_stream()
 
