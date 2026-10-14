@@ -34,6 +34,7 @@ def main():
         ("flydsl/quantization/mxfp4_quant_kernel_pre_dual.py", "flydsl_quant_mxfp4_h16"),
         ("flydsl/gemm/gemm_a6w4_kernel_tuned.py", "gemm_a6w4"),
         ("flydsl/gemm/gemm_a6w4_kernel_v0.py", "gemm_a6w4"),
+        ("flydsl/flux/a6w4_fwd_pack.py", "a6w4_fwd_pack"),
         ("flydsl/quantization/a6w4_quant.py", "quant_act_a6w4"),
         ("flydsl/quantization/a6w4_quant_triton.py", "quant_act_a6w4"),
         ("flydsl/attention/flash_attn_fwd_flux.py", "flux_attn_fwd"),

@@ -39,6 +39,9 @@ from primus_turbo.flydsl.utils.prims import _DPP_QUAD_SWAP1, _dpp_add_f32, _row1
 
 _OOB = 0x7FFFFFFF  # word offset past any SRD -> buffer_load returns 0 / buffer_store dropped
 
+# Import-time layout choice; a32 is captured by each builder and included in its cache key.
+_A6W4_DENSE_ACT = os.getenv("FLUX_A6W4_DENSE_ACT", "0") == "1"
+
 
 BLK = 256
 MB = 32  # MXFP4 micro-block size (elements per e8m0 scale)
@@ -432,10 +435,17 @@ def _emit_dual_body(
     XPAD=None,
     XOFF=None,
     row_fp6=False,
+    a32=32,
     row_bias=None,
     XSTR=None,
     gelu=False,
     BIAS=None,
+    affine=False,
+    RSTD=None,
+    NMR=None,
+    SHIFT=None,
+    SCALE=None,
+    rows_per_batch_tiles=None,
 ):
     """Emit one fused-dual tile (rowwise + colwise-transpose mxfp4 cast) for block
     ``bid``. ``row_2d``/``col_2d`` pick the C++ ``USE_2D_BLOCK`` amax geometry; the
@@ -483,22 +493,45 @@ def _emit_dual_body(
     SRD is built would be silently dropped as OOB instead of landing in the
     right slice.
 
-    ``row_fp6`` makes the row half the A6W4 activation operand instead: E2M3 codes with
-    ``row_bias`` as its scale rounding bias, stored FP8-padded (24 code bytes + 8 zero bytes
-    per micro-block, ROW_OUT a [R, C] byte tensor) with ROW_SC in shuffle_scale_w4 order.
-    The col half is unchanged. Only the plain 2D path (legpack included) supports it.
+    ``row_fp6`` emits E2M3 row codes with ``row_bias`` for scale rounding. ``a32=32``
+    uses padded [R, C] bytes; ``a32=24`` uses dense [R, 3*C/4] bytes in the 64-row/128-K
+    plane permutation. For legs, C here is the full XPAD width. ROW_SC stays in
+    shuffle_scale_w4 order; the column half is unchanged.
 
     ``XSTR`` (legpack only) makes X this leg's own tensor with row stride ``XSTR``, rather than
     the shared ``[R, XPAD]`` tensor read at column ``XOFF``. ``gelu`` applies `_gelu1_torch` to
     the loaded bf16 and rounds back to bf16 before the LDS store, so both halves see the bytes a
     materialised torch ``gelu(x, approximate="tanh")`` would have held. ``BIAS`` (with ``gelu``)
-    is this leg's bf16 bias, added in f32 before the GELU: Inductor's fused ``gelu(x + bias)``."""
+    is this leg's bf16 bias, added in f32 before the GELU: Inductor's fused ``gelu(x + bias)``.
+
+    ``affine`` (optimize round 4 / P2b, plain non-legpack path only) folds the ``ln_mod``
+    producer's LayerNorm-modulate math into this same tile-load hook, so the pack never reads
+    or writes a materialised ``y`` at all: ``RSTD``/``NMR`` are a lightweight leading kernel's
+    per-row ``[R]`` fp32 outputs (row LayerNorm stats only -- mean/var reduced into
+    ``rstd = 1/sqrt(var+eps)`` and ``nmr = -mean*rstd``, no shift/scale, no store of a
+    modulated activation); ``SHIFT``/``SCALE`` are the real ``[B, C]`` bf16 modulate tensors
+    (int32-viewed ``[B, C/2]``, same convention as ``BIAS`` above). For each loaded bf16 pair
+    this computes ``t = x*rstd + nmr; y = t*(1+scale) + shift`` in f32 (one bf16 rounding at
+    the ``cvt_pk_bf16_f32`` repack, matching campaign-lessons.md Sec.7's "match torch's scalar
+    arithmetic" rule) before the LDS store, so the row/col quantize phases below see exactly
+    the bf16 bytes a materialised ``(1+scale)*layer_norm(x)+shift`` would have held. Every
+    scored ``ln_mod`` shape's ``L`` (rows per batch) is a multiple of ``_TR``, so one ``_TR``-
+    row tile never straddles a batch boundary: ``rows_per_batch_tiles`` (``= L // _TR``, a
+    Python int baked in at kernel-build time -- one compiled kernel per distinct ``L``) turns
+    the block's row-tile index into that tile's batch index with one cheap, wave-uniform
+    integer divide per block (not per row), the same ``fx.Int32 // python-int`` idiom
+    ``ncblk = C // _TC`` above already relies on."""
     if row_fp6 and (batched or padded or row_2d or row_sr or skip_row):
         raise ValueError("row_fp6 supports only the plain, unpadded, non-SR 2D dual")
     if (XSTR is not None or gelu) and not legpack:
         raise ValueError("XSTR and gelu are legpack-only")
     if BIAS is not None and not gelu:
         raise ValueError("BIAS is only added ahead of the GELU")
+    if affine and (gelu or legpack):
+        raise ValueError("affine is for the plain (non-legpack, non-gelu) dual path")
+    if affine and (RSTD is None or NMR is None or SHIFT is None or SCALE is None
+                   or rows_per_batch_tiles is None):
+        raise ValueError("affine requires RSTD, NMR, SHIFT, SCALE, rows_per_batch_tiles")
     if ncblk is None:
         ncblk = C // _TC
     xpad = XPAD if legpack else C  # X's true per-row stride (elements)
@@ -573,7 +606,8 @@ def _emit_dual_body(
             gro = XOFF >> 3
             grsc = XOFF >> 5
         if row_fp6:
-            orsrc = _srd(ROW_OUT, r0i * arith.index_cast(T.index, xpad >> 2), 4, _TR * xpad)
+            row_words = (xpad >> 5) * (a32 // 4)
+            orsrc = _srd(ROW_OUT, r0i * arith.index_cast(T.index, row_words), 4, _TR * row_words * 4)
             rscrsrc = _srd(ROW_SC, arith.index(0), 1, R * (xpad >> 5))
         elif not skip_row:
             orsrc = _srd(ROW_OUT, r0i * arith.index_cast(T.index, cpad >> 3), 4, _TR * (cpad >> 3) * 4)
@@ -583,6 +617,15 @@ def _emit_dual_body(
 
     if BIAS is not None:
         bsrc = _srd(BIAS, arith.index(0), 4, (C >> 1) * 4)
+    if affine:
+        # One batch index per BLOCK (not per row): see the ``affine`` docstring
+        # paragraph above for why this integer divide is legal and cheap here.
+        b_idx = rblk // rows_per_batch_tiles
+        rstd_src = _srd(RSTD, arith.index(0), 4, R * 4)
+        nmr_src = _srd(NMR, arith.index(0), 4, R * 4)
+        bc_off = b_idx * (C >> 1)
+        shift_src = _srd(SHIFT, bc_off, 4, (C >> 1) * 4)
+        scale_src = _srd(SCALE, bc_off, 4, (C >> 1) * 4)
     # ---- coalesced tile load -> LDS ----
     for chunk in range_constexpr(_NLOAD):
         tw = chunk * (BLK * 4) + tid * 4
@@ -607,6 +650,26 @@ def _emit_dual_body(
                     g0, g1 = g0 + fx.Float32(b2[0]), g1 + fx.Float32(b2[1])
                     gelu1 = _gelu1_torch
                 words.append(rocdl.cvt_pk_bf16_f32(gelu1(g0), gelu1(g1)))
+            vec = Vec.from_elements(words, fx.Int32)
+        if const_expr(affine):
+            arow = r0 + tr
+            rstd_v = fx.Float32(buffer_ops.buffer_load(rstd_src, arow, vec_width=1, dtype=T.f32))
+            nmr_v = fx.Float32(buffer_ops.buffer_load(nmr_src, arow, vec_width=1, dtype=T.f32))
+            svec = buffer_ops.buffer_load(shift_src, c0w + wc, vec_width=4, dtype=T.i32)
+            scvec = buffer_ops.buffer_load(scale_src, c0w + wc, vec_width=4, dtype=T.i32)
+            words = []
+            for q in range_constexpr(4):
+                v2 = _bf16_pair_to_f32(vec[q])
+                sh2 = _bf16_pair_to_f32(svec[q])
+                sc2 = _bf16_pair_to_f32(scvec[q])
+                x0, x1 = fx.Float32(v2[0]), fx.Float32(v2[1])
+                t0 = math.fma(x0, rstd_v, nmr_v)
+                t1 = math.fma(x1, rstd_v, nmr_v)
+                sp0 = fx.Float32(1.0) + fx.Float32(sc2[0])
+                sp1 = fx.Float32(1.0) + fx.Float32(sc2[1])
+                y0 = math.fma(t0, sp0, fx.Float32(sh2[0]))
+                y1 = math.fma(t1, sp1, fx.Float32(sh2[1]))
+                words.append(rocdl.cvt_pk_bf16_f32(y0, y1))
             vec = Vec.from_elements(words, fx.Int32)
         _lds_store_vec4(lds.buf.ptr, tw, vec)
     # DS writes must retire before any thread reads the tile (a bare s_barrier
@@ -698,9 +761,20 @@ def _emit_dual_body(
                     gcmb = cblk * (_TC // 32) + cmb
                     if legpack:
                         gcmb = gcmb + grsc
-                    ow = r_row * (xpad >> 2) + gcmb * 8
-                    _store_words_vec4(orsrc, ow, rwords[0:4])
-                    _store_words_vec4(orsrc, ow + 4, [rwords[4], rwords[5], fx.Int32(0), fx.Int32(0)])
+                    if a32 == 24:
+                        # 64-row / 128-K tiles: four low-16B planes, then two paired high-8B planes.
+                        # The SRD already folds r0; gcmb includes the leg offset in the full width.
+                        ow = (r_row >> 6) * (64 * row_words) + (gcmb >> 2) * 1536 + (r_row & 63) * 4
+                        _store_words_vec4(orsrc, ow + (gcmb & 3) * 256, rwords[0:4])
+                        buffer_ops.buffer_store(
+                            Vec.from_elements(rwords[4:6], fx.Int32),
+                            orsrc,
+                            ow + (4 + ((gcmb & 3) >> 1)) * 256 + (gcmb & 1) * 2,
+                        )
+                    else:
+                        ow = r_row * (xpad >> 2) + gcmb * 8
+                        _store_words_vec4(orsrc, ow, rwords[0:4])
+                        _store_words_vec4(orsrc, ow + 4, [rwords[4], rwords[5], fx.Int32(0), fx.Int32(0)])
                     # shuffle_scale_w4: (r, c) -> [r/32, c/8, c%4, r%16, (c/4)%2, (r/16)%2]
                     gr = r0 + r_row
                     so = (
@@ -2509,14 +2583,41 @@ _TORCH_GELU_KBETA = 0.7978845608028654  # M_SQRT2 * M_2_SQRTPI * 0.5, rounded to
 
 
 def _tanh_ocml(v):
-    """f32 tanh, instruction for instruction __ocml_tanh_f32 (what torch's tanh lowers to on ROCm)."""
+    """f32 tanh, bit-exact to __ocml_tanh_f32 (what torch's tanh lowers to on ROCm).
+
+    optimize round 4 (P4, campaign 20261010_162818 goal.md Sec F1/F4): the big-|y|
+    branch's exponential is spelled ``exp2(y * _DG_TWO_LOG2E)`` instead of
+    ``exp(y * 2.0)``. exp(y*2.0) == exp2(y*2.0*log2(e)) == exp2(y*_DG_TWO_LOG2E)
+    algebraically -- only the exponential's INPUT SCALING changes, trading the
+    extra ``v_mul_f32`` for the range-reduction the backend's exp() lowering emits
+    around a bare v_exp_f32 (rndne/cvt_i32/ldexp/sub -- the ISA dump before this
+    change shows exactly that chain). The poly branch (`small`), the `y < 0.625`
+    select, and the final `copysign` are all untouched, so the output bit pattern
+    is unchanged by construction, not by a reassociation argument. Verified
+    byte-exact against the unmodified exp() form over ~700M (preact, bias) pairs
+    at 3 input magnitudes and 2 seeds (n_diff [0,0,0,0] on all four pack tensors,
+    every shape -- goal.md F4) and reconfirmed via this round's own `bit_exact`/
+    `mismatch_frac` gates on the real kernel. Direct before/after ISA census on
+    the real production kernel symbol (`_a6w4_dual_legs_kernel_0`, same compile
+    key the live `gelu`/`legs` bench kinds use -- not an isolated reconstruction):
+    gelu shape (8192x12288) VALU 2983->2536, legs shape (16384 rows) VALU
+    2984->2537 -- both -447 VALU (-15.0%), total ISA word count -426/-429; single-
+    call wall time 154.6->135.8us (gelu) and 306.1->279.6us (legs); the 4-value
+    output checksum is byte-identical before/after in both shapes (bit-exact).
+    Official N=12 `bench.sh` samples (round 4) vs round 3's N=3 (P1-only)
+    official samples: ms -1.58ms/step overall, decomposing into single_l2
+    pack_ms -1.01ms/step (legs' GELU leg) and double_fc2 ms-pack_ms-gemm_ms
+    residual -0.60ms/step (gelu kind) -- exceeds the -0.7..-0.84ms/step predicted
+    band. Reached from both the `legs` (0.0 byte-exact gate) and `gelu` (<=1%
+    gate) kinds' GELU leg via `_gelu1_torch`, since both now route through the
+    same fused-dual legpack body (P1)."""
     y = math.absf(v)
     x2 = v * v
     p = fx.Float32(_OCML_TANH_C[0])
     for c in _OCML_TANH_C[1:]:
         p = math.fma(x2, p, fx.Float32(c))
     small = math.fma(x2, y * p, y)
-    e = math.exp(y * 2.0)
+    e = math.exp2(y * fx.Float32(_DG_TWO_LOG2E))
     big = math.fma(fx.Float32(-2.0), fx.Float32(rocdl.rcp(T.f32, _raw(e + fx.Float32(1.0)))), fx.Float32(1.0))
     return math.copysign(arith.select(y < fx.Float32(0.625), small, big), v)
 
@@ -2540,6 +2641,58 @@ def _gelu1_torch(x):
     f32 sums of two bf16, which is what a GELU of a bf16 GEMM output plus a bf16 bias sees."""
     inner = math.fma(fx.Float32(_DG_KK), (x * x) * x, x) * _TORCH_GELU_KBETA
     return (x * 0.5) * (_tanh_ocml(inner) + fx.Float32(1.0))
+
+
+# ---- P1 raw-exp2 tanh helpers for the one-launch legs packer -----------------------
+# (optimize round 2 / P1, campaign 20261010_223800 goal.md Sec 3) -------------------
+#
+# `_tanh_ocml`'s big-|y| branch calls `math.exp2(y * _DG_TWO_LOG2E)`. `math.exp2`
+# lowers through LLVM's generic exp2 expansion, which wraps the bare `v_exp_f32` in
+# a denormal-RESULT guard (`arg < -126.0f ? (add 64, exp2, ldexp by -64) : (exp2
+# directly)`). That guard is PROVABLY DEAD on this call site: the argument is
+# `y * _DG_TWO_LOG2E` with `y = math.absf(v) >= 0` and `_DG_TWO_LOG2E > 0`, so the
+# argument is always `>= 0`, never `< -126.0f` -- `vcc` is always false, both
+# `v_cndmask`s always select 0, the guard's `add` adds 0 and its `ldexp` shifts by
+# 0. `rocdl.exp2` emits the bare `v_exp_f32` with none of that dead guard: SAME
+# BITS BY CONSTRUCTION, not a reassociation argument -- confirmed in ANALYZE by a
+# whole-buffer byte-exact compare of all four packs against the unmodified-
+# `math.exp2` kernel (goal.md Sec 3, "P1"). ISA delta measured on the w=12288 leg:
+# 3026 -> 2641 instructions, VALU 2537 -> 2215 (-322, -12.7%), `s_nop` 187 -> 128,
+# matching the predicted opcode deltas exactly (`v_cmp_gt_f32` -64, `v_cndmask`
+# -128, `v_add_f32` -64, `v_ldexp_f32` -64).
+#
+# `_tanh_ocml`/`_gelu1_torch` stay byte-for-byte unchanged -- task.yaml: they are
+# helpers `_emit_dual_body` calls, and `_emit_dual_body` feeds the frozen reference
+# `flydsl_quant_a6w4_act_dual_legs`, so editing them in place would speed up the
+# reference too and hide the gain. `rocdl.exp2` is the raw ODS op (unlike
+# `rocdl.rcp` used one line below, `flydsl.expr.rocdl` does not wrap `exp2` with an
+# argument-converting helper), so the argument needs the same `_raw(...)`
+# pre-conversion and `fx.Float32(...)` re-wrap `rocdl.rcp` already uses here.
+def _tanh_ocml_rawexp2(v):
+    """Copy of `_tanh_ocml` with exactly one line changed: `e = ...` uses the raw
+    `rocdl.exp2` intrinsic instead of `math.exp2`, deleting the provably-dead
+    denormal guard documented above. Every other line -- the poly branch
+    (`small`), the `y < 0.625` select, the final `copysign` -- is identical."""
+    y = math.absf(v)
+    x2 = v * v
+    p = fx.Float32(_OCML_TANH_C[0])
+    for c in _OCML_TANH_C[1:]:
+        p = math.fma(x2, p, fx.Float32(c))
+    small = math.fma(x2, y * p, y)
+    e = fx.Float32(rocdl.exp2(T.f32, _raw(y * fx.Float32(_DG_TWO_LOG2E))))
+    big = math.fma(fx.Float32(-2.0), fx.Float32(rocdl.rcp(T.f32, _raw(e + fx.Float32(1.0)))), fx.Float32(1.0))
+    return math.copysign(arith.select(y < fx.Float32(0.625), small, big), v)
+
+
+def _gelu1_torch_rawexp2(x):
+    """Copy of `_gelu1_torch` that calls `_tanh_ocml_rawexp2` instead of
+    `_tanh_ocml` -- see that function's docstring. Used only by
+    `_emit_dual_body_merged` (the one-launch legs packer's own copy of
+    `_emit_dual_body`); every other caller of the GELU helpers, including
+    `_emit_dual_body` itself, is untouched."""
+    inner = math.fma(fx.Float32(_DG_KK), (x * x) * x, x) * _TORCH_GELU_KBETA
+    return (x * 0.5) * (_tanh_ocml_rawexp2(inner) + fx.Float32(1.0))
+
 
 
 def _bf16_pair_to_f32(word):
@@ -5504,13 +5657,13 @@ def flydsl_quant_mxfp4_h16_col(x_bf16, fp4_dtype, scale_rounding_mode=0, sr=Fals
 # ---- A6W4 activation dual: FP6 fprop operand + MXFP4 Wgrad col pack from one tile read ----
 
 
-def _build_a6w4_dual_launch(col_locality=False, xcd_remap=False):
+def _build_a6w4_dual_launch(col_locality=False, xcd_remap=False, a32=32):
     _DualSS = _make_dual_struct(False)
 
     @flyc.kernel(known_block_size=[BLK, 1, 1])
     def _a6w4_dual_kernel(
         X: fx.Tensor,  # int32 view [R, C/2]
-        ROW_OUT: fx.Tensor,  # int32 view [R, C/4]: FP8-padded FP6
+        ROW_OUT: fx.Tensor,  # int32 view [R, C*a32/128]: FP6 row pack
         ROW_SC: fx.Tensor,  # uint8 [R*C/32], shuffle_scale_w4
         COL_OUT: fx.Tensor,  # int32 view [C, R/8]
         COL_SC: fx.Tensor,  # uint8 [C, R/32]
@@ -5540,6 +5693,7 @@ def _build_a6w4_dual_launch(col_locality=False, xcd_remap=False):
             col_locality=col_locality,
             xcd_remap=xcd_remap,
             row_fp6=True,
+            a32=a32,
             row_bias=ROW_BIAS,
         )
 
@@ -5573,21 +5727,22 @@ def a6w4_act_dual_eligible(R, C):
 
 def flydsl_quant_a6w4_act_dual(x_bf16):
     """One read of a bf16 [R, C] activation for both of its A6W4-recipe packs:
-      (aq [R, C] uint8, sa [R*C/32] uint8)  the A6W4 fprop operand, the same bytes as
-                                             a6w4_quant.quant_act_a6w4 (E2M3, scale bias 0)
+      (aq [R, C*a32/32] uint8, sa [R*C/32] uint8)  the A6W4 fprop operand (E2M3, scale bias 0);
+          a32=24 dense preshuffle with FLUX_A6W4_DENSE_ACT=1, otherwise 32-byte padded
       (co [C, R/2] fp4, cs [C, R/32] e8m0)  the Wgrad col pack, the same bytes as
                                              flydsl_quant_mxfp4_h16_col(x, fp4, 0)
     Requires a6w4_act_dual_eligible(R, C)."""
     import torch
 
     R, C = x_bf16.shape
-    key = (int(R), int(C))
+    a32 = 24 if _A6W4_DENSE_ACT else 32
+    key = (int(R), int(C), a32)
     ent = _A6W4_DUAL.get(key)
     if ent is None:
         col_locality, xcd_remap = _pick_block_order(R, C, True, True, False, False)
-        raw = _build_a6w4_dual_launch(col_locality, xcd_remap)
+        raw = _build_a6w4_dual_launch(col_locality, xcd_remap, a32)
         x = torch.zeros((R, C // 2), dtype=torch.int32, device="cuda")
-        ro = torch.zeros((R, C // 4), dtype=torch.int32, device="cuda")
+        ro = torch.zeros((R, C * a32 // 128), dtype=torch.int32, device="cuda")
         rs = torch.zeros((R * C // 32,), dtype=torch.uint8, device="cuda")
         co = torch.zeros((C, R // 8), dtype=torch.int32, device="cuda")
         cs = torch.zeros((C, R // 32), dtype=torch.uint8, device="cuda")
@@ -5598,7 +5753,7 @@ def flydsl_quant_a6w4_act_dual(x_bf16):
         ent = (fn, grid_x)
         _A6W4_DUAL[key] = ent
     fn, grid_x = ent
-    aq = x_bf16.new_empty((R, C), dtype=torch.uint8)
+    aq = x_bf16.new_empty((R, C * a32 // 32), dtype=torch.uint8)
     sa = x_bf16.new_empty((R * C // 32,), dtype=torch.uint8)
     co = x_bf16.new_empty((C, R // 2), dtype=torch.float4_e2m1fn_x2)
     cs = x_bf16.new_empty((C, R // 32), dtype=torch.float8_e8m0fnu)
@@ -5618,7 +5773,164 @@ def flydsl_quant_a6w4_act_dual(x_bf16):
     return aq, sa, co, cs
 
 
-def _build_a6w4_dual_legs_launch(col_locality, xcd_remap, gelu, has_bias):
+# ---- A6W4 activation dual with the ln_mod producer folded in (P2b) --------------------
+# optimize round 4 / overall round 6 (P2b, campaign 20261010_162818 goal.md): P2a (round 3 /
+# overall round 5) replaced the Inductor LayerNorm+modulate producer with a one-launch Triton
+# kernel that still writes a full bf16 `y` the pack then rereads -- one extra HBM write + one
+# extra HBM read of the whole activation. This variant removes BOTH: a lightweight leading
+# kernel (`a6w4_fwd_pack.py`'s `_ln_stats`) reads x once and emits only the per-row [R] fp32
+# LayerNorm stats (rstd, nmr = -mean*rstd -- no shift/scale, no stored y), and THIS kernel's
+# own tile-load hook (the `affine` branch in `_emit_dual_body`) computes
+# `t = x*rstd + nmr; y = t*(1+scale) + shift` directly from the raw bf16 x it already has to
+# read for the pack, rounds once to bf16, and feeds that straight into the unchanged row/col
+# quantize phases below. Net HBM traffic for the producer+pack half of one ln_mod call drops
+# from {read x, write y, read y} (P2a, 3 full-size ops) to {read x (stats), read x (pack)} (P2b,
+# 2 full-size ops) -- the same `x` the pack reads is reused by the stats kernel too, so this is
+# strictly fewer full-tensor HBM passes, not a different amount of the SAME pass moved around.
+def _build_a6w4_dual_affine_launch(col_locality, xcd_remap, rows_per_batch_tiles, a32):
+    _DualSS = _make_dual_struct(False)
+
+    @flyc.kernel(known_block_size=[BLK, 1, 1])
+    def _a6w4_dual_affine_kernel(
+        X: fx.Tensor,  # int32 view [R, C/2]
+        RSTD: fx.Tensor,  # fp32 [R], this row's 1/sqrt(var+eps)
+        NMR: fx.Tensor,  # fp32 [R], this row's -mean*rstd
+        SHIFT: fx.Tensor,  # int32 view of bf16 [B, C/2] modulate shift
+        SCALE: fx.Tensor,  # int32 view of bf16 [B, C/2] modulate scale
+        ROW_OUT: fx.Tensor,  # int32 view [R, C*a32/128]: FP6 row pack
+        ROW_SC: fx.Tensor,  # uint8 [R*C/32], shuffle_scale_w4
+        COL_OUT: fx.Tensor,  # int32 view [C, R/8]
+        COL_SC: fx.Tensor,  # uint8 [C, R/32]
+        R: fx.Int32,
+        C: fx.Int32,
+        ROW_BIAS: fx.Int32,
+        COL_BIAS: fx.Int32,
+    ):
+        lds = fx.SharedAllocator().allocate(_DualSS).peek()
+        tid = fx.thread_idx.x
+        _emit_dual_body(
+            True,
+            True,
+            False,
+            False,
+            lds,
+            tid,
+            X,
+            ROW_OUT,
+            ROW_SC,
+            COL_OUT,
+            COL_SC,
+            R,
+            C,
+            fx.block_idx.x,
+            COL_BIAS,
+            col_locality=col_locality,
+            xcd_remap=xcd_remap,
+            row_fp6=True,
+            a32=a32,
+            row_bias=ROW_BIAS,
+            affine=True,
+            RSTD=RSTD,
+            NMR=NMR,
+            SHIFT=SHIFT,
+            SCALE=SCALE,
+            rows_per_batch_tiles=rows_per_batch_tiles,
+        )
+
+    @flyc.jit
+    def _a6w4_dual_affine_launch(
+        X: fx.Tensor,
+        RSTD: fx.Tensor,
+        NMR: fx.Tensor,
+        SHIFT: fx.Tensor,
+        SCALE: fx.Tensor,
+        ROW_OUT: fx.Tensor,
+        ROW_SC: fx.Tensor,
+        COL_OUT: fx.Tensor,
+        COL_SC: fx.Tensor,
+        R: fx.Int32,
+        C: fx.Int32,
+        ROW_BIAS: fx.Int32,
+        COL_BIAS: fx.Int32,
+        grid_x: fx.Int32,
+        stream: fx.Stream,
+    ):
+        _a6w4_dual_affine_kernel(
+            X, RSTD, NMR, SHIFT, SCALE, ROW_OUT, ROW_SC, COL_OUT, COL_SC, R, C, ROW_BIAS, COL_BIAS
+        ).launch(grid=(grid_x, 1, 1), block=(BLK, 1, 1), stream=stream)
+
+    return _a6w4_dual_affine_launch
+
+
+_A6W4_DUAL_LNMOD = {}
+
+
+def flydsl_quant_a6w4_act_dual_lnmod(x_bf16, rstd, nmr, shift, scale):
+    """`flydsl_quant_a6w4_act_dual((1+scale)*layer_norm(x)+shift)` without writing or
+    rereading the modulated activation: `rstd`/`nmr` ([R] fp32, from `a6w4_fwd_pack.py`'s
+    `_ln_stats`) and `shift`/`scale` ([B, C] bf16, B = x_bf16.shape[0] // L) are consumed
+    directly inside the dual pack's own tile-load hook. Requires a6w4_act_dual_eligible(R, C)
+    and L (= R // B) a multiple of 64 (every scored ln_mod shape's L is 256 or 512)."""
+    import torch
+
+    R, C = x_bf16.shape
+    Bsz = shift.shape[0]
+    L = R // Bsz
+    rows_per_batch_tiles = L // _TR
+    a32 = 24 if _A6W4_DENSE_ACT else 32
+    key = (int(R), int(C), int(L), a32)
+    ent = _A6W4_DUAL_LNMOD.get(key)
+    if ent is None:
+        col_locality, xcd_remap = _pick_block_order(R, C, True, True, False, False)
+        raw = _build_a6w4_dual_affine_launch(col_locality, xcd_remap, rows_per_batch_tiles, a32)
+        x = torch.zeros((R, C // 2), dtype=torch.int32, device="cuda")
+        rstd_d = torch.zeros((R,), dtype=torch.float32, device="cuda")
+        nmr_d = torch.zeros((R,), dtype=torch.float32, device="cuda")
+        shift_d = torch.zeros((Bsz, C // 2), dtype=torch.int32, device="cuda")
+        scale_d = torch.zeros((Bsz, C // 2), dtype=torch.int32, device="cuda")
+        ro = torch.zeros((R, C * a32 // 128), dtype=torch.int32, device="cuda")
+        rs = torch.zeros((R * C // 32,), dtype=torch.uint8, device="cuda")
+        co = torch.zeros((C, R // 8), dtype=torch.int32, device="cuda")
+        cs = torch.zeros((C, R // 32), dtype=torch.uint8, device="cuda")
+        grid_x = (R // _TR) * (C // _TC)
+        fn = flyc.compile(
+            raw,
+            *_static_layout(x, rstd_d, nmr_d, shift_d, scale_d, ro, rs, co, cs),
+            R,
+            C,
+            0,
+            1 << 21,
+            grid_x,
+            torch.cuda.current_stream(),
+        )
+        ent = (fn, grid_x)
+        _A6W4_DUAL_LNMOD[key] = ent
+    fn, grid_x = ent
+    aq = x_bf16.new_empty((R, C * a32 // 32), dtype=torch.uint8)
+    sa = x_bf16.new_empty((R * C // 32,), dtype=torch.uint8)
+    co = x_bf16.new_empty((C, R // 2), dtype=torch.float4_e2m1fn_x2)
+    cs = x_bf16.new_empty((C, R // 32), dtype=torch.float8_e8m0fnu)
+    fn(
+        x_bf16,
+        rstd,
+        nmr,
+        shift,
+        scale,
+        aq,
+        sa,
+        co,
+        cs,
+        R,
+        C,
+        0,
+        _mxfp4_scale_rounding_bias(0),
+        grid_x,
+        torch._C._cuda_getCurrentRawStream(x_bf16.device.index),
+    )
+    return aq, sa, co, cs
+
+
+def _build_a6w4_dual_legs_launch(col_locality, xcd_remap, gelu, has_bias, a32):
     _DualSS = _make_dual_struct(False)
 
     @flyc.kernel(known_block_size=[BLK, 1, 1])
@@ -5663,6 +5975,7 @@ def _build_a6w4_dual_legs_launch(col_locality, xcd_remap, gelu, has_bias):
             gelu=gelu,
             BIAS=BIAS if has_bias else None,
             row_fp6=True,
+            a32=a32,
             row_bias=ROW_BIAS,
         )
 
@@ -5711,7 +6024,8 @@ def flydsl_quant_a6w4_act_dual_legs(xs, gelus, biases=None):
     C = sum(widths)
     biases = biases or (None,) * len(xs)
     x0 = xs[0]
-    aq = x0.new_empty((R, C), dtype=torch.uint8)
+    a32 = 24 if _A6W4_DENSE_ACT else 32
+    aq = x0.new_empty((R, C * a32 // 32), dtype=torch.uint8)
     sa = x0.new_empty((R * C // 32,), dtype=torch.uint8)
     co = x0.new_empty((C, R // 2), dtype=torch.float4_e2m1fn_x2)
     cs = x0.new_empty((C, R // 32), dtype=torch.float8_e8m0fnu)
@@ -5728,18 +6042,18 @@ def flydsl_quant_a6w4_act_dual_legs(xs, gelus, biases=None):
             assert b.shape == (w,), f"bias {tuple(b.shape)} is not the leg's width ({w},)"
             assert b.dtype == torch.bfloat16, f"bias dtype {b.dtype} is not bfloat16"
             assert b.is_contiguous(), f"bias {tuple(b.shape)} strides {b.stride()} not contiguous"
-        key = (R, w, C, s, bool(g), b is not None)
+        key = (R, w, C, s, bool(g), b is not None, a32)
         ent = _A6W4_DUAL_LEGS.get(key)
         if ent is None:
             col_locality, xcd_remap = _pick_block_order(R, w, True, True, False, False)
-            raw = _build_a6w4_dual_legs_launch(col_locality, xcd_remap, bool(g), b is not None)
+            raw = _build_a6w4_dual_legs_launch(col_locality, xcd_remap, bool(g), b is not None, a32)
             grid_x = (R // _TR) * (w // _TC)
             fn = flyc.compile(
                 raw,
                 *_static_layout(
                     torch.zeros((R, s // 2), dtype=torch.int32, device="cuda"),
                     torch.zeros((w // 2,), dtype=torch.int32, device="cuda"),
-                    torch.zeros((R, C // 4), dtype=torch.int32, device="cuda"),
+                    torch.zeros((R, C * a32 // 128), dtype=torch.int32, device="cuda"),
                     torch.zeros((R * C // 32,), dtype=torch.uint8, device="cuda"),
                     torch.zeros((C, R // 8), dtype=torch.int32, device="cuda"),
                     torch.zeros((C, R // 32), dtype=torch.uint8, device="cuda"),
@@ -5759,6 +6073,1054 @@ def flydsl_quant_a6w4_act_dual_legs(xs, gelus, biases=None):
         fn, grid_x, no_bias = ent
         fn(x, no_bias if b is None else b, aq, sa, co, cs, R, w, C, xoff, s, 0, col_bias, grid_x, st)
         xoff += w
+    return aq, sa, co, cs
+
+
+# ---- A6W4 dual-legs ONE-LAUNCH pack (optimize round 1 / P3, campaign ---------------
+# 20261010_223800 goal.md) -----------------------------------------------------------
+#
+# `flydsl_quant_a6w4_act_dual_legs` above launches one `_a6w4_dual_legs_kernel` PER
+# leg (two launches for the real `legs` kind: attn [M,3072] no-GELU, preact [M,12288]
+# bias+GELU). goal.md's round-0 kernel trace found the gap between those two
+# dispatches is 0.00 us -- already back-to-back -- so merging them into one launch
+# does not by itself recover GPU time; it only pays off with the right block map. A
+# NAIVE merge (one grid over the concatenated width, the champion's own
+# xcd_remap/col_locality split applied to the WHOLE merged width) measured a
+# REGRESSION (+12.2/+12.8 us this round): xcd_remap is a bijection over the merged
+# tile RANGE, and the leg0/leg1 boundary (column 3072) does not line up with that
+# bijection's per-lane boundaries, so some XCD lanes get only leg0's cheap tiles and
+# others get only leg1's GELU-heavy tiles -- 1/8 of the machine finishes early and
+# idles while the rest is still churning through GELU. This is almost certainly why
+# the two prior campaigns that listed one-launch legs first (`a6w4-fwd-quant-gelu`
+# Oct 5, `a6w4-fwd-pack` Oct 10) never shipped it.
+#
+# The fix measured this round: give every XCD lane its OWN proportional share of
+# EACH leg, instead of one shared share of the merged range. `_emit_dual_body`'s own
+# `xcd_remap=True` path derives its per-lane block count purely from the (R, C) of
+# the SPECIFIC CALL it is handed (`_per = (R // _TR) * (C // _TC) // 8`), so calling
+# it ONCE PER LEG with that leg's own (R, width) and a `bid` that starts at 0 at the
+# beginning of that leg's own block range reproduces EXACTLY the per-lane tile
+# ownership that leg's OWN standalone launch already had (same formula, same `_per`)
+# -- no separate lane/local-index arithmetic needs re-deriving. Splitting one merged
+# grid at `leg0_blocks` (`block_idx.x < leg0_blocks` -> leg0, else leg1 with `bid`
+# re-biased by `-leg0_blocks`) and running each half through `_emit_dual_body`
+# UNCHANGED, each with its OWN leg's col_locality/xcd_remap oracle pick, therefore
+# gives every physical XCD lane (`block_idx.x % 8`, fixed by the hardware's own
+# round-robin dispatch -- unaffected by anything the kernel body does) the SAME
+# proportional mix of leg0/leg1 tiles the two separate launches already had, while
+# cutting the dispatch count from 2 to 1 (38 instead of 76 per training step). This
+# only changes WHICH grid a block's bid belongs to and HOW that bid is renumbered
+# before `_emit_dual_body` ever runs; the per-tile row/col quantize math inside
+# `_emit_dual_body` (left byte-for-byte unchanged, per task.yaml) is untouched, so
+# the result is bit-exact by construction -- confirmed this round on all four packs
+# (aq/sa/co/cs, whole-buffer zero-filled compare, not a slice: `sa` is stored in
+# shuffle_scale_w4 order, not row-major, so a slice-based check reports a bogus
+# mismatch -- pitfalls.md and goal.md Sec 4 item 3).
+#
+# The `if block_idx.x < LEG0_BLOCKS` branch below is a RUNTIME, BLOCK-UNIFORM
+# condition (block_idx.x is the same value for every thread in a workgroup), so the
+# `fx.barrier()` calls inside each arm's `_emit_dual_body` are safe (pitfalls.md: a
+# divergent barrier needs per-THREAD divergence to hang; this is per-BLOCK, uniform,
+# a function of block_idx only). Both legs reuse the SAME LDS struct/footprint
+# (`_make_dual_struct(False)`, the same one `_build_a6w4_dual_legs_launch` already
+# allocates) since no block ever runs both arms.
+
+# ---- `_emit_dual_body` copy for the one-launch legs packer, +P1 -------------------
+# (optimize round 2 / P1, campaign 20261010_223800 goal.md Sec 3/5) -----------------
+#
+# Byte-for-byte copy of `_emit_dual_body` above with exactly ONE line changed: the
+# `gelu=True, BIAS is not None` branch's `gelu1 = _gelu1_torch` becomes
+# `gelu1 = _gelu1_torch_rawexp2` (the raw-`rocdl.exp2` tanh defined above -- see its
+# docstring for the dead-guard argument). `_emit_dual_body` itself stays byte-for-
+# byte unchanged, as task.yaml requires (it is reachable from the frozen reference
+# `flydsl_quant_a6w4_act_dual_legs`); `_build_a6w4_dual_legs_merged_launch` below
+# calls THIS copy instead, so only the one-launch packer's own GELU leg gets the
+# faster tanh. Every other line -- the SRD setup, the ROW phase, the COL phase, the
+# `legpack`/`row_fp6`/`xcd_remap` machinery -- is identical to `_emit_dual_body`, so
+# a correctness regression here can only come from the one line that differs (and
+# that line is bit-exact by the argument in `_tanh_ocml_rawexp2`'s docstring,
+# re-confirmed on this exact kernel by this round's whole-buffer byte-exact gate).
+
+# ---- N3: LDS bank-conflict mitigation, merged-packer-only --------------------------
+# (optimize round 8 / N3, campaign 20261010_223800 goal.md Sec 6) --------------------
+#
+# gfx950 LDS: 64 banks x 4B, bank = (byte_addr // 4) % 64. The tile buffer's native
+# row stride is `_TCW` i32-words; with the shipped default (`_TCW=128`, a multiple
+# of 64), EVERY LDS-internal address of the form `row*_TCW + col_word` loses all of
+# `row`'s information once `% 64` is taken (`row*128 % 64 == 0` for every `row`), so
+# two accesses that use DIFFERENT rows but the SAME `col_word` always collide in the
+# same bank. Brute-force simulation over all 256 threads x 4 waves (see round
+# report) found this hits THREE distinct `lds.buf`-relative addressing sites in this
+# function's actually-traced configuration (`row_2d=False, col_2d=False`, the only
+# configuration `_build_a6w4_dual_legs_merged_launch` ever uses): the tile-load
+# store, the ROW-phase read, and the COL-phase read. The COL-phase site was not
+# previously measured in goal.md and is a new finding this round.
+#
+# Two independent defects, each needing its OWN fix (proven non-overlapping by
+# simulation -- applying one never changes whether the other is needed):
+#   (a) ROW phase (`base_w = r_row*_TCW + cmb*16`): `cmb` and `cmb+4` give IDENTICAL
+#       `cmb*16 % 64` (their only difference, bit 6, is exactly what `% 64` always
+#       discards) -> worst-case 16-way conflict. A column-word-only XOR swizzle
+#       CANNOT fix this: if two values already collide mod 64 before an XOR, XORing
+#       both with the SAME mask (a function of `row` only) preserves that collision
+#       (XOR preserves equality against a shared mask). Only padding the ROW STRIDE
+#       itself helps, since that makes `row*stride % 64` stop being identically
+#       zero -- this is Fix B. Simulation sweep: the smallest stride pad that is (i)
+#       legal (a multiple of 4, so `_lds_load_vec4`'s vec4 reads stay aligned) and
+#       (ii) actually effective is +4 words (`_TCW` 128->132), bringing this down to
+#       a 4-way floor (+8/+16/+32 round-trip back to 16-way -- the floor itself is a
+#       SEPARATE, irreducible 4-way collision from `cmb`'s own mod-4 periodicity
+#       within one row, which no stride choice escapes; full sweep in round report).
+#   (b) COL phase (`(row0+row)*_TCW + cw`): `row0 = _mmb*32` folds in
+#       `_pl_g = tid & 1`, so the two `_pl_g` groups' rows differ by exactly 32; for
+#       ANY even stride (required to keep `_TCW`+pad a multiple of 4),
+#       `32*stride % 64 == 0` always, so NO padding can ever separate these two
+#       groups (padding fixes (a) but structurally cannot also fix (b)). This is a
+#       true distinct-address conflict (not a free same-address broadcast); fixed
+#       instead by Fix A: XOR the row's bit 5 -- the exact bit that encodes which
+#       `_pl_g`/`_mmb` group a row belongs to -- into bit 4 of the column word
+#       before addressing LDS. Bit 4 is free to repurpose: it is untouched by the
+#       vec4-alignment bits (0-1) and, per simulation, this swizzle alone takes the
+#       COL phase from a true 2-way conflict down to 1 (pure same-address hardware
+#       broadcast, free) without perturbing the ROW phase or the tile-load store.
+#
+# The two fixes are additive and verified independent: the pad changes `row*stride`
+# uniformly for both `_pl_g` groups (so it cannot help or hurt the swizzle's ability
+# to tell them apart), and the swizzle only ever touches bit 4 of the column word,
+# never the row-stride term the pad changes. `_N3_PAD`/`_N3_SWZ` gate each fix
+# independently so they can be (and this round were) measured alone and combined.
+# Only the THREE i32-offset expressions that index `lds.buf` inside this function
+# (tile-load store, ROW-phase `base_w`, COL-phase `word`) are touched; every
+# c0w/global-memory address, `_TR`, `_TC`, `_GW`, `_RMB` (hence `_NMB`, unchanged at
+# `_RMB//_GW == 1 > 0`), and the frozen `_emit_dual_body` are untouched.
+_N3_PAD = False  # Fix B: pad the LDS-internal row stride
+_N3_SWZ = False  # Fix A: XOR row's bit 5 into the column word's bit 4
+_N3_PAD_AMT = 4  # dwords of padding when _N3_PAD; simulation floor-4way set is
+# {4,12,20,28,36,44,52,60} mod 64 (+8/+16/+32/.../+0 round-trip back to 16-way) --
+# swept across this whole set (plus a "reuse the already-live tw" reformulation):
+# EVERY value lands next_free_vgpr at 97 (one even at 129), vs baseline 81 --
+# crossing the CDNA4 85->102 occupancy-allocation boundary (kernel-implementation-
+# notes.md Sec.7 'Joint co-saturation') is a robust, formula-independent property
+# of giving the LDS-internal stride a value that no longer matches the GLOBAL
+# c0w/goff stride, not an artifact of a poor specific pad choice.
+#
+# BOTH flags default OFF: rocprofv3 PMC counters (SQ_LDS_BANK_CONFLICT /
+# SQ_LDS_IDX_ACTIVE, reproduced exactly across 2 independent runs) prove Fix B
+# alone cuts the measured bank-conflict ratio 0.50->0.36, Fix A alone 0.50->0.30,
+# and BOTH together 0.50->0.00 (complete elimination) -- so the bank-conflict
+# MECHANISM this round targeted is real and now fully fixable on command. But
+# 8-card-replicated interleaved A/B/A/B/A wall-clock timing (`ref`/`none` canary
+# included every run) shows this does NOT turn into a net speedup: pad/both
+# measure net SLOWER than the unpadded baseline (avg +1.4/+0.9 us min, +1.5/+2.2
+# us med over `none`, consistent with the VGPR/occupancy cost above outweighing
+# the bank-conflict win), and swz alone is a wash (avg -0.01/-0.02 us, i.e.
+# indistinguishable from noise despite being FREE -- same VGPR/instruction
+# footprint as baseline). GRBM_GUI_ACTIVE (total active cycles) is flat within
+# ~2% across all 4 variants despite the bank-conflict elimination, confirming
+# directly that LDS bank conflicts are NOT this kernel's wall-clock-gating
+# resource -- something else (VGPR/occupancy, or GELU's own critical path) is.
+# Leaving both OFF ships the zero-risk, measured-neutral choice; flip these for
+# a quick re-test if a future round frees VGPR headroom elsewhere first (that
+# would be the point to re-try Fix B, now that its cost is precisely known).
+
+
+def _n3_tcwp():
+    """The (possibly padded) LDS-internal row stride for this function's 3
+    `lds.buf`-relative addressing sites. Always derived from the LIVE `_TCW` (never
+    frozen at import time) so it stays correct even if `_set_tile_geom` is mutating
+    `_TCW` around some unrelated kernel's compilation elsewhere in the module.
+    GLOBAL memory addressing (c0w, goff, bias/shift/scale loads) always uses the
+    real `_TCW` directly, never this value."""
+    return _TCW + (_N3_PAD_AMT if _N3_PAD else 0)
+
+
+def _n3_swz(row_idx, col_word):
+    """Fix A: XOR `row_idx`'s bit 5 into bit 4 of `col_word`. A fixed-per-row XOR
+    mask is a bijection within that row (can only permute addresses already
+    distinct for that row, never create a new intra-row collision), and the mask
+    (16 or 0) is itself a multiple of 4, so every `col_word` this is called with
+    (already a multiple of 4 at all 3 call sites) stays a multiple of 4 -- the
+    vec4-load/store alignment every call site relies on is preserved.
+    ``(row_idx & 32) >> 1`` is the same mask as ``((row_idx >> 5) & 1) << 4`` (2
+    ops instead of 3: AND then SHR, vs SHR then AND then SHL) -- isolate bit 5
+    (value 32 or 0) first, then one shift right by 1 lands it on bit 4 (16 or 0)."""
+    if not _N3_SWZ:
+        return col_word
+    return col_word ^ ((row_idx & 32) >> 1)
+
+
+# ---- P2: hoist the per-tile BIAS vector out of the tile-load chunk loop -------
+# (optimize round 9, campaign 20261010_223800 goal.md Sec 6 / manager directive) --
+#
+# `wc = tw % _TCW` inside the `for chunk in range_constexpr(_NLOAD):` loop below is
+# CHUNK-INVARIANT: `tw = chunk*(BLK*4) + tid*4` and `BLK*4` (1024) is always a
+# multiple of `_TCW` for every geometry this kernel ever ships (`_TC` is pinned to
+# 256 by `_pick_tile_geom`'s own legality check -- see its docstring -- so
+# `_TCW=_TC//2=128` and `1024 % 128 == 0`; the only caller of this function never
+# overrides the tile geometry around its compile either, so in practice `_TCW` is
+# always exactly 128), so `wc == (tid*4) % _TCW` regardless of `chunk`. The BIAS
+# vector a GELU leg reads (`bvec = buffer_load(bsrc, c0w+wc, ...)`) is therefore
+# the IDENTICAL 16 bytes on every one of the `_NLOAD` (8) trips through the loop --
+# measured in ANALYZE round 1 (`lever A/B`: -1.2...-1.6 us standalone) but never
+# actually landed in the shipped merged body until now (round 8's kb_check traced
+# the on-disk code and found `bvec` still reloaded every chunk).
+_P2_HOIST_BIAS = True  # True: load bvec once before the loop. False (for A/B):
+# reproduces the pre-round-9 reload-every-chunk behaviour exactly.
+
+
+# ---- N2: COL phase, one lane owns a whole LDS word instead of half -----------
+# (optimize round 9, campaign 20261010_223800 goal.md Sec 6 N2) -----------------
+#
+# The COL phase's `col_2d=False` loop (the only configuration this entry point
+# ever traces) assigns `cw = c_col >> 1` where `c_col = _pl_j + _p*_PLC` and
+# `_pl_j = tid >> 1`. For `_GW=2` (hardcoded a few lines below, not geometry-
+# derived), `_PLC = BLK//_GW` is always even, so two lanes whose `_pl_j` differ by
+# exactly 1 (any pair `_pl_j = 2m, 2m+1`, i.e. `tid` and `tid^2`) compute the SAME
+# `cw` within the SAME pass and (whenever they also share `_pl_g`, hence the same
+# `_mmb`/`row0`) read the IDENTICAL LDS address on every `row` -- each lane
+# independently issuing its own `ds_read` and keeping only ONE 16-bit half
+# (`half = c_col & 1` selects which) of the 32-bit result via `arith.select`.
+#
+# Restructured: `cw = tid >> 1` directly indexes an i32 WORD (not a column), so
+# EVERY one of the `_TCW` words in a row-microblock is visited EXACTLY ONCE per
+# `_pl_g` (instead of `_TC` columns visited once each, two lanes per word) over
+# `_NPASS2 = _TCW // _PLC` passes (half of the original `_NPASS`, since there are
+# half as many words as columns). Each visiting lane extracts BOTH halves
+# (`word << 16` for the even column `2*cw`, `word & 0xFFFF0000` for the odd column
+# `2*cw+1`) -- both are USED (one per output column), so the `arith.select` goes
+# away entirely rather than half its result being discarded by the lane that
+# doesn't own that half. `_finish_microblock` still runs exactly once per OUTPUT
+# column (same total call count: `_NPASS2 * _NMB * 2 == _NPASS * _NMB`), so this
+# targets the `ds_read` count alone, not the per-column finish/store cost.
+#
+# Bit-exact by construction: for a fixed (c_col, mmb), `cw = c_col>>1` and
+# `half = c_col&1` are unchanged, so the even branch's `word << 16` and the odd
+# branch's `word & 0xFFFF0000` are the EXACT two expressions `arith.select` chose
+# between before, read from the EXACT same LDS address, built in the EXACT same
+# ascending-`row` order -- `_finish_microblock`'s output is a pure function of
+# that 32-element list, so byte-for-byte identical.
+#
+# Risk this round's own goal.md flags and this round measures rather than assumes:
+# holding BOTH `cbits_e`/`cbits_o` (64 live i32-equivalents) simultaneously while
+# the row loop runs is DOUBLE the single `cbits` list (32) the original holds at
+# any one time -- gfx950 occupancy steps at next_free_vgpr 64/73/85/102/128/170/256
+# (kernel-implementation-notes.md Sec.7), and round 8 found a much smaller +16-
+# dword LDS-stride change alone crossed 81->97. Measure `next_free_vgpr`/spill
+# BEFORE trusting any timing (same rule round 8 already paid for).
+_N2_COL_FUSED = True  # True: the word-granular rewrite above. False: byte-for-
+# byte the pre-round-9 half-select loop (unchanged behaviour).
+
+
+def _emit_dual_body_merged(
+    row_rht,
+    col_rht,
+    row_2d,
+    col_2d,
+    lds,
+    tid,
+    X,
+    ROW_OUT,
+    ROW_SC,
+    COL_OUT,
+    COL_SC,
+    R,
+    C,
+    bid,
+    scale_rounding_bias,
+    gx=0,
+    gro=0,
+    grsc=0,
+    gco=0,
+    gcsc=0,
+    gmul=1,
+    padded=False,
+    ncblk=None,
+    CP=None,
+    RP=None,
+    col_locality=False,
+    xcd_remap=False,
+    batched=False,
+    row_sr=False,
+    col_sr=False,
+    sr_seed=None,
+    sr_gbid=None,
+    skip_row=False,
+    legpack=False,
+    XPAD=None,
+    XOFF=None,
+    row_fp6=False,
+    a32=32,
+    row_bias=None,
+    XSTR=None,
+    gelu=False,
+    BIAS=None,
+    affine=False,
+    RSTD=None,
+    NMR=None,
+    SHIFT=None,
+    SCALE=None,
+    rows_per_batch_tiles=None,
+):
+    """Emit one fused-dual tile (rowwise + colwise-transpose mxfp4 cast) for block
+    ``bid``. ``row_2d``/``col_2d`` pick the C++ ``USE_2D_BLOCK`` amax geometry; the
+    batched-3D kernel passes per-expert base offsets ``gx/gro/grsc/gco/gcsc`` and
+    ``gmul=G`` to widen the SRDs over the whole 3D tensor (R,C stay per-expert).
+    ``padded`` (non-256 K / non-128 N): X is the real [R,C] but outputs use K_pad=CP /
+    N_pad=RP cols (caller zero-inits so pad stays 0, matching HIP); loads past real C
+    mask to 0 and writes past K_pad / real-C rows go to _OOB so the store drops them.
+    ``xcd_remap`` 8:1-remaps ``bid`` before the block-order split below, so consecutive
+    *logical* tile ids land on the same gfx950 XCD/L2 slice (see ``_pick_block_order``,
+    which only ever sets this where the block count is a verified multiple of 8).
+
+    ``skip_row`` (optimize round 9 / N2): when True, the ROW phase is never
+    traced and ``ROW_OUT``/``ROW_SC`` are never touched (may be ``None``) --
+    used by the col-only transpose-read kernel (``_build_colq_kernel``) for a
+    caller that only wants the col pack (e.g. weight's Dgrad operand, whose
+    row pack Fprop already gets separately from the cheap flat
+    ``_rowq_kernel``, so computing a row half here too would be wasted work).
+    Every existing caller passes ``skip_row=False`` (the default), so this is
+    a pure addition: the traced IR for every current caller is unchanged.
+
+    ``legpack`` (optimize round 10 / P6): when True, this call packs a COLUMN
+    SLICE ``X[:, XOFF:XOFF+C]`` of a wider ``[R, XPAD]`` BF16 tensor into the
+    matching column slice of a SHARED ``[R, XPAD/8]``-row-out /
+    ``[XPAD, R/8]``-col-out pair -- ``C`` keeps meaning THIS call's own local
+    leg width (grid sizing / ``ncblk`` / every row- and col-phase LOCAL loop
+    bound are all unchanged), while ``XPAD`` is the wider buffer's true
+    per-row stride and ``XOFF`` is this leg's starting column within it. Two
+    (or more) legpack calls at increasing ``XOFF`` therefore build up exactly
+    what one monolithic ``C=XPAD`` dual call would have, without a
+    concatenation step on either side. Both ``XPAD`` and ``XOFF`` MUST be
+    traced ``fx.Int32`` kernel arguments (never plain Python ints) -- the
+    same requirement ``CP``/``RP`` already have, for the same reason: a raw
+    Python int reaching ``arith.index_cast`` on this (non-batched) SRD path
+    raises ``AttributeError: 'int' object has no attribute '_CAPIPtr'``.
+
+    Independent of ``padded``/``CP``/``RP`` (the pre-existing OOB-tail-mask
+    for a single non-tile-aligned dispatch): every leg width this campaign
+    uses (3072/9216/12288) is already a multiple of ``_TC``, so the
+    ``padded`` masking selects would be pure overhead here and are
+    deliberately left off (``legpack`` calls always pass ``padded=False``).
+    The column offset folds into the COL_OUT SRD's *base* (via ``c0i``), not
+    into a post-hoc store offset like ``gco`` -- a leg offset is typically
+    far larger than one tile's ``num_records`` bound, so adding it after the
+    SRD is built would be silently dropped as OOB instead of landing in the
+    right slice.
+
+    ``row_fp6`` emits E2M3 row codes with ``row_bias`` for scale rounding. ``a32=32``
+    uses padded [R, C] bytes; ``a32=24`` uses dense [R, 3*C/4] bytes in the 64-row/128-K
+    plane permutation. For legs, C here is the full XPAD width. ROW_SC stays in
+    shuffle_scale_w4 order; the column half is unchanged.
+
+    ``XSTR`` (legpack only) makes X this leg's own tensor with row stride ``XSTR``, rather than
+    the shared ``[R, XPAD]`` tensor read at column ``XOFF``. ``gelu`` applies `_gelu1_torch` to
+    the loaded bf16 and rounds back to bf16 before the LDS store, so both halves see the bytes a
+    materialised torch ``gelu(x, approximate="tanh")`` would have held. ``BIAS`` (with ``gelu``)
+    is this leg's bf16 bias, added in f32 before the GELU: Inductor's fused ``gelu(x + bias)``.
+
+    ``affine`` (optimize round 4 / P2b, plain non-legpack path only) folds the ``ln_mod``
+    producer's LayerNorm-modulate math into this same tile-load hook, so the pack never reads
+    or writes a materialised ``y`` at all: ``RSTD``/``NMR`` are a lightweight leading kernel's
+    per-row ``[R]`` fp32 outputs (row LayerNorm stats only -- mean/var reduced into
+    ``rstd = 1/sqrt(var+eps)`` and ``nmr = -mean*rstd``, no shift/scale, no store of a
+    modulated activation); ``SHIFT``/``SCALE`` are the real ``[B, C]`` bf16 modulate tensors
+    (int32-viewed ``[B, C/2]``, same convention as ``BIAS`` above). For each loaded bf16 pair
+    this computes ``t = x*rstd + nmr; y = t*(1+scale) + shift`` in f32 (one bf16 rounding at
+    the ``cvt_pk_bf16_f32`` repack, matching campaign-lessons.md Sec.7's "match torch's scalar
+    arithmetic" rule) before the LDS store, so the row/col quantize phases below see exactly
+    the bf16 bytes a materialised ``(1+scale)*layer_norm(x)+shift`` would have held. Every
+    scored ``ln_mod`` shape's ``L`` (rows per batch) is a multiple of ``_TR``, so one ``_TR``-
+    row tile never straddles a batch boundary: ``rows_per_batch_tiles`` (``= L // _TR``, a
+    Python int baked in at kernel-build time -- one compiled kernel per distinct ``L``) turns
+    the block's row-tile index into that tile's batch index with one cheap, wave-uniform
+    integer divide per block (not per row), the same ``fx.Int32 // python-int`` idiom
+    ``ncblk = C // _TC`` above already relies on."""
+    if row_fp6 and (batched or padded or row_2d or row_sr or skip_row):
+        raise ValueError("row_fp6 supports only the plain, unpadded, non-SR 2D dual")
+    if (XSTR is not None or gelu) and not legpack:
+        raise ValueError("XSTR and gelu are legpack-only")
+    if BIAS is not None and not gelu:
+        raise ValueError("BIAS is only added ahead of the GELU")
+    if affine and (gelu or legpack):
+        raise ValueError("affine is for the plain (non-legpack, non-gelu) dual path")
+    if affine and (RSTD is None or NMR is None or SHIFT is None or SCALE is None
+                   or rows_per_batch_tiles is None):
+        raise ValueError("affine requires RSTD, NMR, SHIFT, SCALE, rows_per_batch_tiles")
+    if ncblk is None:
+        ncblk = C // _TC
+    xpad = XPAD if legpack else C  # X's true per-row stride (elements)
+    xstr = xpad if XSTR is None else XSTR
+    cpad = CP if padded else (xpad if legpack else C)  # row-out column extent (K_pad)
+    rpad = RP if padded else R  # col-out column extent (N_pad)
+    if xcd_remap:
+        # gfx950 round-robins consecutive blockIdx across 8 XCD L2 slices
+        # (kernel-implementation-notes.md Sec.5), which defeats col_locality's whole
+        # point of running same-column tiles back-to-back for L2 write-combining.
+        # Re-numbering so 1/8 of the *logical* tile range maps to each physical lane
+        # (chunk size 1: r1/r2 measured chunk=2 worse -- see memory.md) puts those
+        # back-to-back tiles on one XCD's L2. This only permutes which tile this
+        # block computes, so it is bit-exact by construction; the caller-side
+        # ``_pick_block_order`` only requests it where ``_nxcd`` divides the total
+        # block count evenly, so ``_per`` below is an exact bijection (no truncation).
+        _nxcd = 8
+        _per = (R // _TR) * ncblk // _nxcd
+        bid = (bid % _nxcd) * _per + (bid // _nxcd)
+    # Block order = which output's partial stores L2 can combine. col_locality (C>R):
+    # row-tile-fastest so blocks writing the same col-out rows run back-to-back and L2
+    # merges the scattered transpose stores; else col-tile-fastest keeps row-out coalesced.
+    if col_locality:
+        nrblk = R // _TR
+        cblk = bid // nrblk
+        rblk = bid % nrblk
+    else:
+        rblk = bid // ncblk
+        cblk = bid % ncblk
+    r0 = rblk * _TR
+    c0w = cblk * _TCW  # i32-word base along C
+
+    # Re-base each SRD in int64 with per-tile/per-expert num_records: a whole-tensor SRD's
+    # num_records (full bytes) overflows the 32-bit field past 4GB (high rows/experts OOB) and
+    # the per-row voffset overflows int32. 2D folds this tile's row (r0)/col (cblk*_TC) base;
+    # batched-3D folds the per-expert base (small experts keep r0/c0 in the offsets). _row0/
+    # _col0 drop the folded base from the additive offsets below.
+    _fold = not batched
+    _row0 = fx.Int32(0) if _fold else r0
+    _col0 = fx.Int32(0) if _fold else cblk * _TC
+
+    # Same SRD-builder as `_srd_at` (module-level, defined below near the row-only
+    # kernel) -- kept as one canonical implementation instead of 3 copies (code-review
+    # dedup; pure address-computation leaf helper, no scheduling/numerics impact).
+    _srd = _srd_at
+
+    if batched:
+        rsrc = _srd(X, gx, 4, R * (C >> 1) * 4)
+        if not skip_row:
+            orsrc = _srd(ROW_OUT, gro, 4, R * (cpad >> 3) * 4)
+            rscrsrc = _srd(ROW_SC, grsc, 1, R * (cpad >> 5))
+        corsrc = _srd(COL_OUT, gco, 4, C * (rpad >> 3) * 4)
+        cscrsrc = _srd(COL_SC, gcsc, 1, C * (rpad >> 5))
+        gx = gro = grsc = gco = gcsc = 0  # expert bases folded into the SRDs above
+    else:
+        r0i = arith.index_cast(T.index, r0)
+        _colbase = cblk * _TC
+        if legpack:
+            # COL_OUT is indexed by ORIGINAL column (its own [C_total, R/8]
+            # "row" axis), so this leg's global start must move the SRD's
+            # BASE, not a post-hoc store offset (see the docstring above).
+            _colbase = _colbase + XOFF
+        c0i = arith.index_cast(T.index, _colbase)
+        rsrc = _srd(X, r0i * arith.index_cast(T.index, xstr >> 1), 4, _TR * (xstr >> 1) * 4)
+        if legpack:
+            # X's own column start (word units) and ROW_OUT's matching start
+            # (word/byte units for data/scale). Plain overwrites, not adds:
+            # `gx`/`gro`/`grsc` are always the unused 0 default on every
+            # legpack call (legpack is never combined with the batched
+            # per-expert offset mechanism these three otherwise serve).
+            gx = fx.Int32(0) if XSTR is not None else XOFF >> 1
+            gro = XOFF >> 3
+            grsc = XOFF >> 5
+        if row_fp6:
+            row_words = (xpad >> 5) * (a32 // 4)
+            orsrc = _srd(ROW_OUT, r0i * arith.index_cast(T.index, row_words), 4, _TR * row_words * 4)
+            rscrsrc = _srd(ROW_SC, arith.index(0), 1, R * (xpad >> 5))
+        elif not skip_row:
+            orsrc = _srd(ROW_OUT, r0i * arith.index_cast(T.index, cpad >> 3), 4, _TR * (cpad >> 3) * 4)
+            rscrsrc = _srd(ROW_SC, r0i * arith.index_cast(T.index, cpad >> 5), 1, _TR * (cpad >> 5))
+        corsrc = _srd(COL_OUT, c0i * arith.index_cast(T.index, rpad >> 3), 4, _TC * (rpad >> 3) * 4)
+        cscrsrc = _srd(COL_SC, c0i * arith.index_cast(T.index, rpad >> 5), 1, _TC * (rpad >> 5))
+
+    if BIAS is not None:
+        bsrc = _srd(BIAS, arith.index(0), 4, (C >> 1) * 4)
+    if affine:
+        # One batch index per BLOCK (not per row): see the ``affine`` docstring
+        # paragraph above for why this integer divide is legal and cheap here.
+        b_idx = rblk // rows_per_batch_tiles
+        rstd_src = _srd(RSTD, arith.index(0), 4, R * 4)
+        nmr_src = _srd(NMR, arith.index(0), 4, R * 4)
+        bc_off = b_idx * (C >> 1)
+        shift_src = _srd(SHIFT, bc_off, 4, (C >> 1) * 4)
+        scale_src = _srd(SCALE, bc_off, 4, (C >> 1) * 4)
+    # ---- coalesced tile load -> LDS ----
+    _n3p = _n3_tcwp()  # N3: padded/swizzled LDS-internal row stride for this call
+    # P2: hoisted bias vector (see `_P2_HOIST_BIAS` docstring above) -- a trace-
+    # time Python branch exactly like the untouched `if BIAS is not None:` below.
+    _bvec_hoist = None
+    if const_expr(gelu):
+        if BIAS is not None:
+            if _P2_HOIST_BIAS:
+                _wc0 = (tid * 4) % _TCW
+                _bvec_hoist = buffer_ops.buffer_load(bsrc, c0w + _wc0, vec_width=4, dtype=T.i32)
+    for chunk in range_constexpr(_NLOAD):
+        tw = chunk * (BLK * 4) + tid * 4
+        tr = tw // _TCW
+        wc = tw % _TCW
+        tw_p = tr * _n3p + _n3_swz(tr, wc)  # N3: LDS store index only -- goff/bvec
+        # below keep addressing GLOBAL memory via the real, unpadded wc/_TCW. (Tried
+        # reusing the already-live `tw` additively -- tw + tr*(_n3p-_TCW) -- instead
+        # of this fresh multiply: measured NO improvement, next_free_vgpr still
+        # 81->97, so the VGPR cost is not from losing this one CSE opportunity;
+        # see round report.)
+        goff = (_row0 + tr) * (xstr >> 1) + c0w + wc + gx
+        if padded:
+            # mask cols past real C -> OOB load returns 0 (rows always valid: R%64==0,
+            # tile is 64 rows, rblk covers exactly R/64 tiles).
+            goff = arith.select((c0w + wc) < (C >> 1), goff, fx.Int32(_OOB))
+        vec = buffer_ops.buffer_load(rsrc, goff, vec_width=4, dtype=T.i32)
+        if const_expr(gelu):
+            if BIAS is not None:
+                if _P2_HOIST_BIAS:
+                    bvec = _bvec_hoist
+                else:
+                    bvec = buffer_ops.buffer_load(bsrc, c0w + wc, vec_width=4, dtype=T.i32)
+            words = []
+            for q in range_constexpr(4):
+                v2 = _bf16_pair_to_f32(vec[q])
+                g0, g1 = fx.Float32(v2[0]), fx.Float32(v2[1])
+                gelu1 = _gelu1_torch_bf16
+                if BIAS is not None:
+                    b2 = _bf16_pair_to_f32(bvec[q])
+                    g0, g1 = g0 + fx.Float32(b2[0]), g1 + fx.Float32(b2[1])
+                    gelu1 = _gelu1_torch_rawexp2
+                words.append(rocdl.cvt_pk_bf16_f32(gelu1(g0), gelu1(g1)))
+            vec = Vec.from_elements(words, fx.Int32)
+        if const_expr(affine):
+            arow = r0 + tr
+            rstd_v = fx.Float32(buffer_ops.buffer_load(rstd_src, arow, vec_width=1, dtype=T.f32))
+            nmr_v = fx.Float32(buffer_ops.buffer_load(nmr_src, arow, vec_width=1, dtype=T.f32))
+            svec = buffer_ops.buffer_load(shift_src, c0w + wc, vec_width=4, dtype=T.i32)
+            scvec = buffer_ops.buffer_load(scale_src, c0w + wc, vec_width=4, dtype=T.i32)
+            words = []
+            for q in range_constexpr(4):
+                v2 = _bf16_pair_to_f32(vec[q])
+                sh2 = _bf16_pair_to_f32(svec[q])
+                sc2 = _bf16_pair_to_f32(scvec[q])
+                x0, x1 = fx.Float32(v2[0]), fx.Float32(v2[1])
+                t0 = math.fma(x0, rstd_v, nmr_v)
+                t1 = math.fma(x1, rstd_v, nmr_v)
+                sp0 = fx.Float32(1.0) + fx.Float32(sc2[0])
+                sp1 = fx.Float32(1.0) + fx.Float32(sc2[1])
+                y0 = math.fma(t0, sp0, fx.Float32(sh2[0]))
+                y1 = math.fma(t1, sp1, fx.Float32(sh2[1]))
+                words.append(rocdl.cvt_pk_bf16_f32(y0, y1))
+            vec = Vec.from_elements(words, fx.Int32)
+        _lds_store_vec4(lds.buf.ptr, tw_p, vec)
+    # DS writes must retire before any thread reads the tile (a bare s_barrier
+    # does NOT wait for LDS); fx.barrier() emits the waitcnt + barrier.
+    fx.barrier()
+
+    # Per-micro-block SR seeds: grid-unique block id folds the tile + loop task so
+    # every micro-block in the launch draws an independent seed (col salted apart
+    # from row). Constexpr row_sr/col_sr -> the plain (seed=None) IR when SR is off.
+    _gbid = bid if sr_gbid is None else sr_gbid
+
+    def _row_seed(k):
+        if not row_sr:
+            return None
+        return _sr_hash(sr_seed ^ (_gbid * (BLK * _RROWTASK) + (k * BLK + tid)))
+
+    def _col_seed(mmb):
+        if not col_sr:
+            return None
+        return _sr_hash((sr_seed ^ _SR_COL_SALT) ^ (_gbid * (BLK * _RMB) + (mmb * BLK + tid)))
+
+    # ---- ROW phase: 32-elem microblocks along C, contiguous LDS (vec4 reads) ----
+    # Skipped entirely (not even traced) when skip_row=True -- a plain Python
+    # bool resolved at trace time (same pattern as row_2d/col_2d/batched
+    # elsewhere in this function), so the col-only kernel's IR never
+    # references ROW_OUT/ROW_SC/orsrc/rscrsrc at all.
+    if not skip_row:
+        if row_2d:
+            # 2D-block amax: the scale spans a whole 32x32 tile = the 32 rows that
+            # share one 32-col micro-block. Pass 1: each thread computes its own
+            # micro-block amax (RHT'd) and writes it to LDS scratch, keeping the
+            # RHT'd vals in registers. Barrier. Pass 2: each thread max-reduces the
+            # 32 amax of its tile, then quantizes its held vals with the tile scale.
+            vf_hold = []
+            meta = []
+            for k in range_constexpr(_RROWTASK):
+                task = k * BLK + tid
+                r_row = task // _RMBC
+                cmb = task % _RMBC
+                base_w = r_row * _TCW + cmb * 16
+                rbits = []
+                for q in range_constexpr(4):
+                    v4 = _lds_load_vec4(lds.buf.ptr, base_w + q * 4)
+                    for j in range_constexpr(4):
+                        word = v4[j]
+                        rbits.append(word << 16)
+                        rbits.append(word & 0xFFFF0000)
+                vf = _microblock_vf(rbits, row_rht, fold_scale=True)
+                _lds_store1(lds.scr.ptr, r_row * _RMBC + cmb, _microblock_amax_f(vf))
+                vf_hold.append(vf)
+                meta.append((r_row, cmb))
+            fx.barrier()
+            for k in range_constexpr(_RROWTASK):
+                r_row, cmb = meta[k]
+                vf = vf_hold[k]
+                row_base = (r_row // 32) * 32  # tile's first row within the LDS tile
+                tile_amax = fx.Int32(0)
+                for i in range_constexpr(32):
+                    tile_amax = _imax(tile_amax, _lds_load1(lds.scr.ptr, (row_base + i) * _RMBC + cmb))
+                native_bits, rbiased = _compute_scale_native(
+                    tile_amax, scale_rounding_bias, exp_up=vf_exp_up(row_rht)
+                )
+                rwords = _cvt_microblock_to_fp4(vf, arith.bitcast(T.f32, native_bits), _row_seed(k))
+                grow = _row0 + r_row
+                gcmb = cblk * _RMBC + cmb
+                ob = grow * (cpad >> 3) + gcmb * 4 + gro
+                sc = grow * (cpad >> 5) + gcmb + grsc
+                if padded:
+                    wok = gcmb < (cpad >> 5)  # rows always valid (R%64==0)
+                    ob = arith.select(wok, ob, fx.Int32(_OOB))
+                    sc = arith.select(wok, sc, fx.Int32(_OOB))
+                _store_words_vec4(orsrc, ob, rwords)
+                buffer_ops.buffer_store(arith.trunci(T.i8, rbiased & 0xFF), rscrsrc, sc)
+        else:
+            for k in range_constexpr(_RROWTASK):
+                task = k * BLK + tid
+                r_row = task // (_TC // 32)
+                cmb = task % (_TC // 32)
+                base_w = r_row * _n3_tcwp() + _n3_swz(r_row, cmb * 16)  # N3
+                rbits = []
+                for q in range_constexpr(4):
+                    v4 = _lds_load_vec4(lds.buf.ptr, base_w + q * 4)
+                    for j in range_constexpr(4):
+                        word = v4[j]
+                        rbits.append(word << 16)
+                        rbits.append(word & 0xFFFF0000)
+                if row_fp6:
+                    rwords, rbiased = _finish_microblock_fp6(rbits, row_rht, row_bias)
+                    gcmb = cblk * (_TC // 32) + cmb
+                    if legpack:
+                        gcmb = gcmb + grsc
+                    if a32 == 24:
+                        # 64-row / 128-K tiles: four low-16B planes, then two paired high-8B planes.
+                        # The SRD already folds r0; gcmb includes the leg offset in the full width.
+                        ow = (r_row >> 6) * (64 * row_words) + (gcmb >> 2) * 1536 + (r_row & 63) * 4
+                        _store_words_vec4(orsrc, ow + (gcmb & 3) * 256, rwords[0:4])
+                        buffer_ops.buffer_store(
+                            Vec.from_elements(rwords[4:6], fx.Int32),
+                            orsrc,
+                            ow + (4 + ((gcmb & 3) >> 1)) * 256 + (gcmb & 1) * 2,
+                        )
+                    else:
+                        ow = r_row * (xpad >> 2) + gcmb * 8
+                        _store_words_vec4(orsrc, ow, rwords[0:4])
+                        _store_words_vec4(orsrc, ow + 4, [rwords[4], rwords[5], fx.Int32(0), fx.Int32(0)])
+                    # shuffle_scale_w4: (r, c) -> [r/32, c/8, c%4, r%16, (c/4)%2, (r/16)%2]
+                    gr = r0 + r_row
+                    so = (
+                        ((((gr >> 5) * (xpad >> 8) + (gcmb >> 3)) * 4 + (gcmb & 3)) * 16 + (gr & 15)) * 2
+                        + ((gcmb >> 2) & 1)
+                    ) * 2 + ((gr >> 4) & 1)
+                    buffer_ops.buffer_store(arith.trunci(T.i8, rbiased & 0xFF), rscrsrc, so)
+                    continue
+                rwords, rbiased = _finish_microblock(rbits, row_rht, scale_rounding_bias, _row_seed(k))
+                grow = _row0 + r_row
+                gcmb = cblk * (_TC // 32) + cmb
+                ob = grow * (cpad >> 3) + gcmb * 4 + gro
+                sc = grow * (cpad >> 5) + gcmb + grsc
+                if padded:
+                    wok = gcmb < (cpad >> 5)  # rows always valid (R%64==0)
+                    ob = arith.select(wok, ob, fx.Int32(_OOB))
+                    sc = arith.select(wok, sc, fx.Int32(_OOB))
+                _store_words_vec4(orsrc, ob, rwords)
+                buffer_ops.buffer_store(arith.trunci(T.i8, rbiased & 0xFF), rscrsrc, sc)
+
+    # ---- COL phase (r2: GW=2, xor=0, cm=0, sc_drop=0) ----
+    _GW = 2
+    _PLC = BLK // _GW  # columns handled per pass
+    _NPASS = _TC // _PLC  # passes over the tile's columns
+    _NMB = _RMB // _GW  # micro-block groups per lane
+    _pl_g = tid & 1
+    _pl_j = tid >> 1
+    if col_2d:
+        fx.barrier()
+        cvf_hold = []
+        cmeta = []
+        for _p in range_constexpr(_NPASS):
+            c_col = _pl_j + _p * _PLC
+            half = c_col & 1
+            cw = c_col >> 1
+            for _mg in range_constexpr(_NMB):
+                _mmb = _mg * _GW + _pl_g
+                row0 = _mmb * 32
+                cbits = []
+                for row in range_constexpr(32):
+                    word = _lds_load1(lds.buf.ptr, (row0 + row) * _TCW + cw)
+                    fb = arith.select(half != 0, word & fx.Int32(-65536), word << 16)
+                    cbits.append(fb)
+                vf = _microblock_vf(cbits, col_rht, fold_scale=True)
+                _lds_store1(lds.scr.ptr, _mmb * _TC + c_col, _microblock_amax_f(vf))
+                cvf_hold.append(vf)
+                cmeta.append((c_col, _mmb, _p * _NMB + _mg))
+        fx.barrier()
+        for _i in range_constexpr(_NPASS * _NMB):
+            c_col, _mmb, _sd = cmeta[_i]
+            vf = cvf_hold[_i]
+            col_base = (c_col // 32) * 32
+            tile_amax = fx.Int32(0)
+            for i in range_constexpr(32):
+                tile_amax = _imax(tile_amax, _lds_load1(lds.scr.ptr, _mmb * _TC + col_base + i))
+            native_bits, cbiased = _compute_scale_native(
+                tile_amax, scale_rounding_bias, exp_up=vf_exp_up(col_rht)
+            )
+            cwords = _cvt_microblock_to_fp4(vf, arith.bitcast(T.f32, native_bits), _col_seed(_sd))
+            gcol = _col0 + c_col
+            gmmb = rblk * _RMB + _mmb
+            cob = gcol * (rpad >> 3) + gmmb * 4 + gco
+            csoff = gcol * (rpad >> 5) + gmmb + gcsc
+            if padded:
+                cok = gcol < C
+                cob = arith.select(cok, cob, fx.Int32(_OOB))
+                csoff = arith.select(cok, csoff, fx.Int32(_OOB))
+            _store_words_vec4(corsrc, cob, cwords)
+            buffer_ops.buffer_store(arith.trunci(T.i8, cbiased & 0xFF), cscrsrc, csoff)
+    elif _N2_COL_FUSED:
+        # N2 (see docstring above `_N2_COL_FUSED`): one lane owns one WHOLE LDS
+        # word (both the even and odd output columns of that word) instead of
+        # half a word, halving the `ds_read` count and removing the half-select.
+        _NPASS2 = _TCW // _PLC
+        assert _TCW % _PLC == 0, "N2 requires _TCW a multiple of _PLC (BLK // _GW)"
+        for _p2 in range_constexpr(_NPASS2):
+            cw = _pl_j + _p2 * _PLC
+            for _mg in range_constexpr(_NMB):
+                _mmb = _mg * _GW + _pl_g
+                row0 = _mmb * 32
+                cbits_e = []
+                cbits_o = []
+                for row in range_constexpr(32):
+                    r_abs = row0 + row
+                    word = _lds_load1(lds.buf.ptr, r_abs * _n3_tcwp() + _n3_swz(r_abs, cw))
+                    cbits_e.append(word << 16)
+                    cbits_o.append(word & fx.Int32(-65536))
+                gmmb = rblk * _RMB + _mmb
+                # `_col_seed`'s argument only needs to be a compile-time-unique
+                # per-call-site disambiguator for this thread's own trace (its
+                # formula already folds in the runtime `tid`); `*2+{0,1}` keeps
+                # the even/odd pair of outputs from this one word from colliding
+                # on the same seed. Inert today (`col_sr` is always False for
+                # this entry point), kept correct for a hypothetical future
+                # caller that turns it on.
+                # even column (2*cw): matches the original's `half == 0`
+                # extraction (`word << 16`) bit-for-bit, same LDS address.
+                cwords_e, cbiased_e = _finish_microblock(
+                    cbits_e, col_rht, scale_rounding_bias, _col_seed((_p2 * _NMB + _mg) * 2 + 0)
+                )
+                c_col_e = cw * 2
+                gcol_e = _col0 + c_col_e
+                cob_e = gcol_e * (rpad >> 3) + gmmb * 4 + gco
+                csoff_e = gcol_e * (rpad >> 5) + gmmb + gcsc
+                if padded:
+                    cok_e = gcol_e < C
+                    cob_e = arith.select(cok_e, cob_e, fx.Int32(_OOB))
+                    csoff_e = arith.select(cok_e, csoff_e, fx.Int32(_OOB))
+                _store_words_vec4(corsrc, cob_e, cwords_e)
+                buffer_ops.buffer_store(arith.trunci(T.i8, cbiased_e & 0xFF), cscrsrc, csoff_e)
+                # odd column (2*cw+1): matches the original's `half == 1`
+                # extraction (`word & 0xFFFF0000`) bit-for-bit, same LDS address.
+                cwords_o, cbiased_o = _finish_microblock(
+                    cbits_o, col_rht, scale_rounding_bias, _col_seed((_p2 * _NMB + _mg) * 2 + 1)
+                )
+                c_col_o = cw * 2 + 1
+                gcol_o = _col0 + c_col_o
+                cob_o = gcol_o * (rpad >> 3) + gmmb * 4 + gco
+                csoff_o = gcol_o * (rpad >> 5) + gmmb + gcsc
+                if padded:
+                    cok_o = gcol_o < C
+                    cob_o = arith.select(cok_o, cob_o, fx.Int32(_OOB))
+                    csoff_o = arith.select(cok_o, csoff_o, fx.Int32(_OOB))
+                _store_words_vec4(corsrc, cob_o, cwords_o)
+                buffer_ops.buffer_store(arith.trunci(T.i8, cbiased_o & 0xFF), cscrsrc, csoff_o)
+    else:
+        for _p in range_constexpr(_NPASS):
+            c_col = _pl_j + _p * _PLC
+            half = c_col & 1
+            cw = c_col >> 1
+            for _mg in range_constexpr(_NMB):
+                _mmb = _mg * _GW + _pl_g
+                row0 = _mmb * 32
+                cbits = []
+                for row in range_constexpr(32):
+                    r_abs = row0 + row
+                    word = _lds_load1(lds.buf.ptr, r_abs * _n3_tcwp() + _n3_swz(r_abs, cw))  # N3
+                    fb = arith.select(half != 0, word & fx.Int32(-65536), word << 16)
+                    cbits.append(fb)
+                cwords, cbiased = _finish_microblock(
+                    cbits, col_rht, scale_rounding_bias, _col_seed(_p * _NMB + _mg)
+                )
+                gcol = _col0 + c_col
+                gmmb = rblk * _RMB + _mmb
+                cob = gcol * (rpad >> 3) + gmmb * 4 + gco
+                csoff = gcol * (rpad >> 5) + gmmb + gcsc
+                if padded:
+                    cok = gcol < C
+                    cob = arith.select(cok, cob, fx.Int32(_OOB))
+                    csoff = arith.select(cok, csoff, fx.Int32(_OOB))
+                _store_words_vec4(corsrc, cob, cwords)
+                buffer_ops.buffer_store(arith.trunci(T.i8, cbiased & 0xFF), cscrsrc, csoff)
+
+
+def _build_a6w4_dual_legs_merged_launch(
+    col_locality0, xcd_remap0, gelu0, has_bias0, col_locality1, xcd_remap1, gelu1, has_bias1, a32
+):
+    # N3: sized to `_n3_tcwp()` (possibly padded), not `_make_dual_struct`'s unpadded
+    # `_NW` -- `_emit_dual_body_merged`'s ROW/COL-phase reads now address `lds.buf`
+    # at `row * _n3_tcwp() + ...` (see `_n3_tcwp`/`_n3_swz` docstrings above). When
+    # `_N3_PAD` is off this is numerically identical to `_make_dual_struct(False)`.
+    @fx.struct
+    class _DualSS:
+        buf: fx.Array[fx.Int32, _TR * _n3_tcwp(), 16]
+
+    @flyc.kernel(known_block_size=[BLK, 1, 1])
+    def _a6w4_dual_legs_merged_kernel(
+        X0: fx.Tensor,  # leg0 int32 view [R, S0/2]
+        BIAS0: fx.Tensor,  # leg0's int32 view of bf16 bias [W0/2]; unread unless has_bias0
+        X1: fx.Tensor,  # leg1 int32 view [R, S1/2]
+        BIAS1: fx.Tensor,  # leg1's int32 view of bf16 bias [W1/2]; unread unless has_bias1
+        ROW_OUT: fx.Tensor,
+        ROW_SC: fx.Tensor,
+        COL_OUT: fx.Tensor,
+        COL_SC: fx.Tensor,
+        R: fx.Int32,
+        W0: fx.Int32,  # leg0's own width
+        W1: fx.Int32,  # leg1's own width
+        XPAD: fx.Int32,  # combined width (W0 + W1), the shared outputs' true stride
+        XOFF1: fx.Int32,  # leg1's starting column in the shared outputs (== W0)
+        XSTR0: fx.Int32,  # leg0's own row stride (elements)
+        XSTR1: fx.Int32,  # leg1's own row stride (elements)
+        LEG0_BLOCKS: fx.Int32,  # grid split: block_idx.x < this -> leg0, else leg1
+        ROW_BIAS: fx.Int32,
+        COL_BIAS: fx.Int32,
+    ):
+        lds = fx.SharedAllocator().allocate(_DualSS).peek()
+        tid = fx.thread_idx.x
+        bid = fx.block_idx.x
+        if bid < LEG0_BLOCKS:
+            _emit_dual_body_merged(
+                True,
+                True,
+                False,
+                False,
+                lds,
+                tid,
+                X0,
+                ROW_OUT,
+                ROW_SC,
+                COL_OUT,
+                COL_SC,
+                R,
+                W0,
+                bid,
+                COL_BIAS,
+                col_locality=col_locality0,
+                xcd_remap=xcd_remap0,
+                legpack=True,
+                XPAD=XPAD,
+                XOFF=fx.Int32(0),
+                XSTR=XSTR0,
+                gelu=gelu0,
+                BIAS=(BIAS0 if has_bias0 else None),
+                row_fp6=True,
+                a32=a32,
+                row_bias=ROW_BIAS,
+            )
+        else:
+            _emit_dual_body_merged(
+                True,
+                True,
+                False,
+                False,
+                lds,
+                tid,
+                X1,
+                ROW_OUT,
+                ROW_SC,
+                COL_OUT,
+                COL_SC,
+                R,
+                W1,
+                bid - LEG0_BLOCKS,
+                COL_BIAS,
+                col_locality=col_locality1,
+                xcd_remap=xcd_remap1,
+                legpack=True,
+                XPAD=XPAD,
+                XOFF=XOFF1,
+                XSTR=XSTR1,
+                gelu=gelu1,
+                BIAS=(BIAS1 if has_bias1 else None),
+                row_fp6=True,
+                a32=a32,
+                row_bias=ROW_BIAS,
+            )
+
+    @flyc.jit
+    def _a6w4_dual_legs_merged_launch(
+        X0: fx.Tensor,
+        BIAS0: fx.Tensor,
+        X1: fx.Tensor,
+        BIAS1: fx.Tensor,
+        ROW_OUT: fx.Tensor,
+        ROW_SC: fx.Tensor,
+        COL_OUT: fx.Tensor,
+        COL_SC: fx.Tensor,
+        R: fx.Int32,
+        W0: fx.Int32,
+        W1: fx.Int32,
+        XPAD: fx.Int32,
+        XOFF1: fx.Int32,
+        XSTR0: fx.Int32,
+        XSTR1: fx.Int32,
+        LEG0_BLOCKS: fx.Int32,
+        ROW_BIAS: fx.Int32,
+        COL_BIAS: fx.Int32,
+        grid_x: fx.Int32,
+        stream: fx.Stream,
+    ):
+        _a6w4_dual_legs_merged_kernel(
+            X0,
+            BIAS0,
+            X1,
+            BIAS1,
+            ROW_OUT,
+            ROW_SC,
+            COL_OUT,
+            COL_SC,
+            R,
+            W0,
+            W1,
+            XPAD,
+            XOFF1,
+            XSTR0,
+            XSTR1,
+            LEG0_BLOCKS,
+            ROW_BIAS,
+            COL_BIAS,
+        ).launch(grid=(grid_x, 1, 1), block=(BLK, 1, 1), stream=stream)
+
+    return _a6w4_dual_legs_merged_launch
+
+
+_A6W4_DUAL_LEGS_MERGED = {}
+
+
+def flydsl_quant_a6w4_act_dual_legs_merged(xs, gelus, biases=None):
+    """Drop-in replacement for `flydsl_quant_a6w4_act_dual_legs`: same `(xs, gelus,
+    biases)` arguments, same `(aq, sa, co, cs)` return, byte-identical. For exactly 2
+    legs (the real `legs` kind), both pack in ONE kernel launch instead of two -- see
+    `_build_a6w4_dual_legs_merged_launch` above for the mechanism and why a naive
+    merge regresses. For any other leg count (today only 1, the `gelu` kind) there is
+    no second leg to merge with, so this forwards unchanged to the reference
+    `flydsl_quant_a6w4_act_dual_legs`, which stays byte-for-byte untouched per
+    task.yaml."""
+    import torch
+
+    if len(xs) != 2:
+        return flydsl_quant_a6w4_act_dual_legs(xs, gelus, biases)
+
+    R = int(xs[0].shape[0])
+    w0, w1 = int(xs[0].shape[1]), int(xs[1].shape[1])
+    C = w0 + w1
+    biases = biases or (None, None)
+    x0, x1 = xs
+    g0, g1 = bool(gelus[0]), bool(gelus[1])
+    b0, b1 = biases[0], biases[1]
+    for x, w in ((x0, w0), (x1, w1)):
+        assert x.shape[0] == R and x.stride(1) == 1 and x.dtype == torch.bfloat16
+    for g, b, w in ((g0, b0, w0), (g1, b1, w1)):
+        if b is not None:
+            # Named, not bare: see flydsl_quant_a6w4_act_dual_legs's own comment above
+            # on why a bare assert here cost a whole job to narrow down once.
+            assert g, f"leg of width {w} has a bias but no GELU"
+            assert b.shape == (w,), f"bias {tuple(b.shape)} is not the leg's width ({w},)"
+            assert b.dtype == torch.bfloat16, f"bias dtype {b.dtype} is not bfloat16"
+            assert b.is_contiguous(), f"bias {tuple(b.shape)} strides {b.stride()} not contiguous"
+
+    a32 = 24 if _A6W4_DENSE_ACT else 32
+    aq = x0.new_empty((R, C * a32 // 32), dtype=torch.uint8)
+    sa = x0.new_empty((R * C // 32,), dtype=torch.uint8)
+    co = x0.new_empty((C, R // 2), dtype=torch.float4_e2m1fn_x2)
+    cs = x0.new_empty((C, R // 32), dtype=torch.float8_e8m0fnu)
+    st = torch._C._cuda_getCurrentRawStream(x0.device.index)
+    col_bias = _mxfp4_scale_rounding_bias(0)
+    s0, s1 = int(x0.stride(0)), int(x1.stride(0))
+
+    key = (R, w0, w1, s0, s1, g0, g1, b0 is not None, b1 is not None, a32)
+    ent = _A6W4_DUAL_LEGS_MERGED.get(key)
+    if ent is None:
+        col_locality0, xcd_remap0 = _pick_block_order(R, w0, True, True, False, False)
+        col_locality1, xcd_remap1 = _pick_block_order(R, w1, True, True, False, False)
+        raw = _build_a6w4_dual_legs_merged_launch(
+            col_locality0,
+            xcd_remap0,
+            g0,
+            b0 is not None,
+            col_locality1,
+            xcd_remap1,
+            g1,
+            b1 is not None,
+            a32,
+        )
+        leg0_blocks = (R // _TR) * (w0 // _TC)
+        leg1_blocks = (R // _TR) * (w1 // _TC)
+        grid_x = leg0_blocks + leg1_blocks
+        fn = flyc.compile(
+            raw,
+            *_static_layout(
+                torch.zeros((R, s0 // 2), dtype=torch.int32, device="cuda"),
+                torch.zeros((w0 // 2,), dtype=torch.int32, device="cuda"),
+                torch.zeros((R, s1 // 2), dtype=torch.int32, device="cuda"),
+                torch.zeros((w1 // 2,), dtype=torch.int32, device="cuda"),
+                torch.zeros((R, C * a32 // 128), dtype=torch.int32, device="cuda"),
+                torch.zeros((R * C // 32,), dtype=torch.uint8, device="cuda"),
+                torch.zeros((C, R // 8), dtype=torch.int32, device="cuda"),
+                torch.zeros((C, R // 32), dtype=torch.uint8, device="cuda"),
+            ),
+            R,
+            w0,
+            w1,
+            C,
+            w0,
+            s0,
+            s1,
+            leg0_blocks,
+            0,
+            col_bias,
+            grid_x,
+            torch.cuda.current_stream(),
+        )
+        ent = (
+            fn,
+            grid_x,
+            leg0_blocks,
+            x0.new_zeros((w0,), dtype=torch.bfloat16),
+            x0.new_zeros((w1,), dtype=torch.bfloat16),
+        )
+        _A6W4_DUAL_LEGS_MERGED[key] = ent
+    fn, grid_x, leg0_blocks, no_bias0, no_bias1 = ent
+    fn(
+        x0,
+        no_bias0 if b0 is None else b0,
+        x1,
+        no_bias1 if b1 is None else b1,
+        aq,
+        sa,
+        co,
+        cs,
+        R,
+        w0,
+        w1,
+        C,
+        w0,
+        s0,
+        s1,
+        leg0_blocks,
+        0,
+        col_bias,
+        grid_x,
+        st,
+    )
     return aq, sa, co, cs
 
 

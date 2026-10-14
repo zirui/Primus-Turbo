@@ -78,10 +78,16 @@ def a6w4_mm_qa(aq, sa, b, bias=None):
 
 
 def a6w4_mm_qa_prequant_w(aq, sa, wq, sb, n, bias=None):
-    """a6w4_mm with both operands already quantized."""
+    """a6w4_mm with padded32 or dense24 AQ and quant_w_a6w4 weight bytes in any shape."""
     from primus_turbo.flydsl.gemm.gemm_a6w4_kernel import M_ALIGN, gemm_a6w4
 
-    m, k = aq.shape
+    m, aq_width = aq.shape
+    # Packed FP4 weight size fixes logical K independently of the activation byte layout.
+    if n <= 0 or (wq.numel() * 2) % n:
+        raise ValueError("a6w4_mm_qa: packed weight size must describe an [N, K] FP4 weight")
+    k = wq.numel() * 2 // n
     if m % M_ALIGN or n % 256 or k % 1024:
         raise ValueError(f"a6w4_mm_qa: M={m} must be a multiple of {M_ALIGN}, N={n} of 256, K={k} of 1024")
+    if aq_width not in (k, k * 3 // 4) or (aq_width != k and m % 64):
+        raise ValueError("a6w4_mm_qa: AQ must be padded32 [M, K] or dense24 [M, 3*K/4] with M % 64 == 0")
     return gemm_a6w4(aq, wq, sa, sb, n, k, bias)
